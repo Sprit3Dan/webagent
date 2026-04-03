@@ -1,0 +1,144 @@
+import React from "react";
+import ChatPane from "./components/ChatPane";
+import StoragePane from "./components/StoragePane";
+import TopBar from "./components/TopBar";
+import { AppProvider } from "./context/AppContext";
+import useChatKeyboard from "./hooks/useChatKeyboard";
+import useChatSession from "./hooks/useChatSession";
+import { ROUTES, SNAPSHOT_FILE_NAME } from "./lib/constants";
+
+function AppShell() {
+
+  const {
+    route,
+    navigate,
+    prompt,
+    setPrompt,
+    status,
+    setStatus,
+    isLoading,
+    telemetryText,
+    pageIndex,
+    pages,
+    currentPage,
+    isOnLastPage,
+    focusedMessageIndex,
+    setFocusedMessageIndex,
+    goPrevPage,
+    goNextPage,
+    listRef,
+    onTouchStart,
+    onTouchEnd,
+    focusComposer,
+    toggleFocusedMessageDetails,
+    copyFocusedMessage,
+    send,
+    composerDisabled,
+    inspectorItems,
+    inspectorStatus,
+    inspectorLoading,
+    selectedFilePath,
+    selectedFileContent,
+    selectedFileMeta,
+    refreshInspector,
+    viewFile,
+    clearCurrentSession,
+  } = useChatSession();
+
+  useChatKeyboard({
+    route,
+    chatRoute: ROUTES.CHAT,
+    currentPageLength: currentPage.length,
+    isOnLastPage,
+    setFocusedMessageIndex,
+    goPrevPage,
+    goNextPage,
+    focusComposer,
+    copyFocusedMessage,
+    toggleFocusedMessageDetails,
+    setStatus,
+  });
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "#0a0f14",
+        color: "#d6e2ee",
+        fontFamily:
+          'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+      }}
+    >
+      <style>
+        {`
+          @keyframes pulseDots { 0%{opacity:.2} 50%{opacity:1} 100%{opacity:.2} }
+          @keyframes blinkBlock { 0%,49%{opacity:1} 50%,100%{opacity:0} }
+        `}
+      </style>
+
+      <TopBar
+        route={route}
+        onNavigate={navigate}
+        isLoading={isLoading}
+        status={status}
+        inspectorStatus={inspectorStatus}
+        telemetryText={telemetryText}
+      />
+
+      {route === ROUTES.CHAT ? (
+        <ChatPane
+          listRef={listRef}
+          pageIndex={pageIndex}
+          pages={pages}
+          currentPage={currentPage}
+          onPrevPage={goPrevPage}
+          onNextPage={goNextPage}
+          onTouchStart={onTouchStart}
+          onTouchEnd={onTouchEnd}
+          isLoading={isLoading}
+          focusedMessageIndex={focusedMessageIndex}
+          showComposer={isOnLastPage}
+          prompt={prompt}
+          onPromptChange={setPrompt}
+          onSend={send}
+          composerDisabled={composerDisabled}
+          composerPlaceholder="Type your message. Enter=send, Shift+Enter=newline, swipe L/R for pages"
+        />
+      ) : (
+        <StoragePane
+          inspectorItems={inspectorItems}
+          inspectorLoading={inspectorLoading}
+          inspectorStatus={inspectorStatus}
+          selectedFilePath={selectedFilePath}
+          selectedFileContent={selectedFileContent}
+          selectedFileMeta={selectedFileMeta}
+          onRefresh={refreshInspector}
+          onClearSession={clearCurrentSession}
+          onViewFile={viewFile}
+        />
+      )}
+
+      {route === ROUTES.STORAGE && (
+        <footer
+          style={{
+            borderTop: "1px solid #24303d",
+            padding: 12,
+            background: "#0f1720",
+          }}
+        >
+          <div style={{ color: "#8ca1b4", fontSize: 12 }}>
+            Active session snapshot file: <code>{SNAPSHOT_FILE_NAME}</code>
+          </div>
+        </footer>
+      )}
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AppProvider>
+      <AppShell />
+    </AppProvider>
+  );
+}

@@ -1,0 +1,49 @@
+name: webagent-dev
+
+services:
+  backend:
+    image: python:3.12-slim
+    working_dir: /app/backend
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt &&
+             python run.py"
+    environment:
+      APP_NAME: webagent-backend
+      ENV: development
+      LOG_LEVEL: INFO
+      HOST: 0.0.0.0
+      PORT: 8000
+      RELOAD: "true"
+      CORS_ORIGINS: '["http://localhost:5173"]'
+      OPENAI_MODEL: nemotron-30b
+      OPENAI_BASE_URL: http://inference.sprit3dan-labs.net/nemotron-30b/v1/
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      REQUIRE_AUTH: "false"
+      COMPACTION_TRIGGER_TOTAL_TOKENS: "64000"
+      COMPACTION_TARGET_TOTAL_TOKENS: "24000"
+    volumes:
+      - ./backend:/app/backend
+      - backend_pip_cache:/root/.cache/pip
+    ports:
+      - "8000:8000"
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app/frontend
+    command: >
+      sh -c "npm install &&
+             npm run dev -- --host 0.0.0.0 --port 5173"
+    environment:
+      VITE_BACKEND_URL: http://backend:8000
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend:/app/frontend
+      - frontend_node_modules:/app/frontend/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  backend_pip_cache:
+  frontend_node_modules:

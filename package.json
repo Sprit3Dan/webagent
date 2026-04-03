@@ -1,0 +1,22 @@
+{
+  "name": "webagent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Root workspace scripts for webagent frontend + backend",
+  "scripts": {
+    "dev": "concurrently -k -n backend,frontend -c green,cyan \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "cd backend && python run.py",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:compose": "docker compose -f docker-compose.dev.yml up --build",
+    "dev:compose:up": "docker compose -f docker-compose.dev.yml up -d --build",
+    "dev:compose:down": "docker compose -f docker-compose.dev.yml down",
+    "dev:compose:logs": "docker compose -f docker-compose.dev.yml logs -f",
+    "dev:compose:restart": "docker compose -f docker-compose.dev.yml down && docker compose -f docker-compose.dev.yml up -d --build",
+    "install:frontend": "cd frontend && npm install",
+    "install:backend": "cd backend && pip install -r requirements.txt",
+    "start": "npm run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}

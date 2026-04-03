@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    HOST=0.0.0.0 \
+    PORT=8000 \
+    FRONTEND_PORT=5173 \
+    OPENAI_MODEL=nemotron-30b \
+    OPENAI_BASE_URL=http://inference.sprit3dan-labs.net/nemotron-30b/v1/ \
+    CHOKIDAR_USEPOLLING=true \
+    WATCHPACK_POLLING=true
+
+WORKDIR /workspace
+
+# System toolchain: curl + bash + nodejs/npm for frontend dev server
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      git \
+      gnupg \
+      build-essential \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python venv + backend deps (kept outside /workspace so bind mounts won't erase them)
+RUN python -m venv /opt/venv
+
+# Preload dependency manifests for faster rebuilds
+COPY backend/requirements.txt /tmp/backend-requirements.txt
+COPY frontend/package.json /tmp/frontend-package.json
+COPY frontend/package-lock.json /tmp/frontend-package-lock.json
+
+RUN pip install -r /tmp/backend-requirements.txt
+
+# Cache frontend packages in image layer (runtime still verifies on startup)
+RUN mkdir -p /opt/frontend \
+    && cp /tmp/frontend-package.json /opt/frontend/package.json \
+    && cp /tmp/frontend-package-lock.json /opt/frontend/package-lock.json \
+    && cd /opt/frontend \
+    && npm ci
+
+EXPOSE 8000 5173
+
+# Dev startup:
+# - assumes project is bind-mounted at /workspace
+# - installs frontend deps on first run if missing
+# - runs backend (reload) + frontend dev server in one container
+CMD ["bash", "-lc", "\
+set -euo pipefail; \
+if [ ! -d /workspace/frontend ] || [ ! -d /workspace/backend ]; then \
+  echo 'Expected source at /workspace with frontend/ and backend/ (bind mount your repo).'; \
+  exit 1; \
+fi; \
+if [ ! -d /workspace/frontend/node_modules ]; then \
+  echo 'Installing frontend dependencies...'; \
+  cd /workspace/frontend && npm install; \
+fi; \
+if [ ! -f /workspace/backend/requirements.txt ]; then \
+  echo 'Missing /workspace/backend/requirements.txt'; \
+  exit 1; \
+fi; \
+trap 'kill 0' INT TERM EXIT; \
+( cd /workspace/backend && uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --reload ) & \
+( cd /workspace/frontend && npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT} ) & \
+wait -n; \
+"]
