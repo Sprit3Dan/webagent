@@ -10,6 +10,17 @@ import {
   writeSnapshotToOpfs,
 } from "../lib/opfs";
 import { normalizeRoute, parseJsonSafe } from "../lib/utils";
+import { postJsonAndConsumeSse } from "../lib/sse";
+import {
+  executeFrontendToolCalls,
+  listFrontendToolDefinitions,
+  loadFrontendToolDefinitionsFromOpfs,
+  toFrontendToolMessage,
+} from "../lib/frontendTools";
+import {
+  listAllSkillMemoryRecords,
+  listStoreRecords,
+} from "../lib/skillMemory";
 import {
   buildTelemetryText,
   clamp,
@@ -20,6 +31,7 @@ import {
   normalizeMessages,
   sanitizeMessage,
 } from "../lib/chatState";
+import { buildContextForLlm } from "../lib/contextBuilder";
 
 export default function useChatSession() {
   const {
@@ -54,6 +66,7 @@ export default function useChatSession() {
   const [inspectorItems, setInspectorItems] = useState([]);
   const [storageReady, setStorageReady] = useState(false);
   const [isHydrated, setIsHydrated] = useState(false);
+  const [toolsReady, setToolsReady] = useState(false);
 
   const listRef = useRef(null);
   const persistTimerRef = useRef(null);
@@ -66,7 +79,7 @@ export default function useChatSession() {
 
   const { pages, lastPageIndex, safePageIndex, currentPage, isOnLastPage } = pagination;
   const telemetryText = useMemo(() => buildTelemetryText(telemetry), [telemetry]);
-  const composerDisabled = !storageReady || !isHydrated || isLoading;
+  const composerDisabled = !storageReady || !isHydrated || !toolsReady || isLoading;
 
   const navigate = useCallback(
     (nextRoute) => {
@@ -136,9 +149,30 @@ export default function useChatSession() {
     [goNextPage, goPrevPage],
   );
 
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      try {
+        await loadFrontendToolDefinitionsFromOpfs({ persistFallback: true });
+      } finally {
+        if (active) setToolsReady(true);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const send = useCallback(async () => {
     if (!storageReady || !isHydrated) {
       setStatus("storage: OPFS not ready");
+      return;
+    }
+
+    if (!toolsReady) {
+      setStatus("tools: loading");
       return;
     }
 
@@ -154,43 +188,231 @@ export default function useChatSession() {
     setStatus("agent: loading");
 
     try {
-      const payload = { ...CONTEXT, stream: false, messages: nextMessages };
-      const res = await fetch("/api/agent/respond", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-tenant-id": CONTEXT.tenantId,
-          "x-user-id": CONTEXT.userId,
-          "x-agent-id": CONTEXT.agentId,
-        },
-        body: JSON.stringify(payload),
-      });
+      let workingMessages = nextMessages;
+      let generatedAggregate = [];
+      let usage = null;
+      let compaction = null;
+      let modelName = CONTEXT.model;
+      let executedTools = 0;
+      let systemContextMessage = null;
 
-      const rawText = await res.text();
-      const data = parseJsonSafe(rawText, null);
+      for (let round = 0; round < 4; round += 1) {
+        let requestMessages = workingMessages;
 
-      if (!res.ok) {
-        const msg = data?.error || data?.detail || rawText || "request failed";
-        throw new Error(msg);
+        if (round === 0) {
+          const historyWithoutCurrent = workingMessages.slice(0, -1);
+          const currentMessage = String(
+            workingMessages[workingMessages.length - 1]?.content || "",
+          );
+
+          const built = await buildContextForLlm({
+            history: historyWithoutCurrent,
+            currentMessage,
+            tenantId: CONTEXT.tenantId,
+            userId: CONTEXT.userId,
+            agentId: CONTEXT.agentId,
+            sessionId: CONTEXT.sessionId,
+            route,
+            page: route === ROUTES.STORAGE ? "storage" : "chat",
+          });
+
+          requestMessages = built.messages;
+          systemContextMessage = built.messages[0] || null;
+        } else if (systemContextMessage) {
+          requestMessages = normalizeMessages([
+            systemContextMessage,
+            ...workingMessages,
+          ]);
+        }
+
+        const payload = {
+          ...CONTEXT,
+          stream: false,
+          messages: requestMessages,
+          tools: listFrontendToolDefinitions(),
+        };
+
+        const streamAssistantId = `stream-assistant-${Date.now()}-${round}`;
+        let liveContent = "";
+        let liveReasoning = "";
+        let liveToolCalls = null;
+
+        const upsertLiveAssistant = () => {
+          setMessages((prev) => {
+            const liveMessage = sanitizeMessage({
+              role: "assistant",
+              content: liveContent,
+              reasoning: liveReasoning || undefined,
+              tool_calls: Array.isArray(liveToolCalls) && liveToolCalls.length
+                ? liveToolCalls
+                : undefined,
+              timestamp: streamAssistantId,
+            });
+
+            const idx = prev.findIndex((m) => m?.timestamp === streamAssistantId);
+            if (idx >= 0) {
+              const next = [...prev];
+              next[idx] = liveMessage;
+              return next;
+            }
+            return [...prev, liveMessage];
+          });
+        };
+
+        const sseEvents = await postJsonAndConsumeSse(
+          "/api/agent/respond/sse",
+          payload,
+          {
+            headers: {
+              "content-type": "application/json",
+              "x-tenant-id": CONTEXT.tenantId,
+              "x-user-id": CONTEXT.userId,
+              "x-agent-id": CONTEXT.agentId,
+            },
+            onEvent: (evt) => {
+              const payloadJson =
+                evt?.json && typeof evt.json === "object"
+                  ? evt.json
+                  : parseJsonSafe(evt?.data || "", null);
+
+              if (!payloadJson) return;
+              if (evt.event !== "delta") return;
+
+              if (payloadJson.type === "content" && typeof payloadJson.text === "string") {
+                liveContent += payloadJson.text;
+                upsertLiveAssistant();
+                return;
+              }
+
+              if (payloadJson.type === "reasoning" && typeof payloadJson.text === "string") {
+                liveReasoning += payloadJson.text;
+                upsertLiveAssistant();
+                return;
+              }
+
+              if (payloadJson.type === "tool_calls" && Array.isArray(payloadJson.toolCalls)) {
+                liveToolCalls = payloadJson.toolCalls;
+                upsertLiveAssistant();
+              }
+            },
+          },
+        );
+
+        const sseData = {
+          model: null,
+          message: null,
+          usage: null,
+          compaction: null,
+          generatedMessages: [],
+          toolEvents: [],
+        };
+
+        for (const evt of sseEvents) {
+          const payloadJson =
+            evt?.json && typeof evt.json === "object"
+              ? evt.json
+              : parseJsonSafe(evt?.data || "", null);
+
+          if (!payloadJson) continue;
+
+          if (evt.event === "meta") {
+            sseData.model = payloadJson.model || sseData.model;
+            continue;
+          }
+
+          if (evt.event === "message") {
+            sseData.generatedMessages.push(payloadJson);
+            continue;
+          }
+
+          if (evt.event === "tool_event") {
+            sseData.toolEvents.push(payloadJson);
+            continue;
+          }
+
+          if (evt.event === "done") {
+            sseData.message = payloadJson.message || sseData.message;
+            sseData.usage = payloadJson.usage || sseData.usage;
+            sseData.compaction = payloadJson.compaction || sseData.compaction;
+          }
+        }
+
+        modelName = sseData.model || modelName;
+        usage = sseData.usage || usage;
+        compaction = sseData.compaction || compaction;
+
+        const generated =
+          Array.isArray(sseData.generatedMessages) && sseData.generatedMessages.length
+            ? sseData.generatedMessages
+            : [sseData.message];
+
+        const normalizedGenerated = generated
+          .filter(Boolean)
+          .map((m) => sanitizeMessage(m));
+
+        if (!normalizedGenerated.length) break;
+
+        generatedAggregate = [...generatedAggregate, ...normalizedGenerated];
+        workingMessages = normalizeMessages([
+          ...workingMessages,
+          ...normalizedGenerated,
+        ]);
+
+        const assistantWithTools = [...normalizedGenerated]
+          .reverse()
+          .find(
+            (m) =>
+              m?.role === "assistant" &&
+              Array.isArray(m?.tool_calls) &&
+              m.tool_calls.length > 0,
+          );
+
+        if (!assistantWithTools?.tool_calls?.length) {
+          break;
+        }
+
+        const toolResults = await executeFrontendToolCalls(
+          assistantWithTools.tool_calls,
+          {
+            tenantId: CONTEXT.tenantId,
+            userId: CONTEXT.userId,
+            agentId: CONTEXT.agentId,
+            sessionId: CONTEXT.sessionId,
+          },
+        );
+
+        executedTools += toolResults.length;
+
+        const toolMessages = toolResults
+          .map((result) => toFrontendToolMessage(result))
+          .map((m) => sanitizeMessage(m));
+
+        if (!toolMessages.length) break;
+
+        generatedAggregate = [...generatedAggregate, ...toolMessages];
+        workingMessages = normalizeMessages([
+          ...workingMessages,
+          ...toolMessages,
+        ]);
       }
 
-      const generated =
-        Array.isArray(data?.generatedMessages) && data.generatedMessages.length
-          ? data.generatedMessages
-          : [data?.message];
-
-      setMessages((prev) => [...prev, ...generated.filter(Boolean).map((m) => sanitizeMessage(m))]);
-
-      const usage = data?.usage || null;
-      const compaction = data?.compaction || null;
+      setMessages((prev) => [
+        ...prev.filter(
+          (m) => !String(m?.timestamp || "").startsWith("stream-assistant-"),
+        ),
+        ...generatedAggregate,
+      ]);
       setTelemetry({ usage, compaction });
 
       const tokenPart = typeof usage?.totalTokens === "number" ? ` · ${usage.totalTokens} tok` : "";
       const compactPart = compaction?.triggered ? ` · compacted ${compaction?.droppedMessages ?? 0}` : "";
-      setStatus(`agent: ready · ${data?.model || CONTEXT.model}${tokenPart}${compactPart}`);
+      const toolPart = executedTools > 0 ? ` · tools ${executedTools}` : "";
+      setStatus(`agent: ready · ${modelName}${tokenPart}${compactPart}${toolPart}`);
     } catch (err) {
       setMessages((prev) => [
-        ...prev,
+        ...prev.filter(
+          (m) => !String(m?.timestamp || "").startsWith("stream-assistant-"),
+        ),
         sanitizeMessage({
           role: "assistant",
           content: `Error: ${err instanceof Error ? err.message : "unknown error"}`,
@@ -203,9 +425,11 @@ export default function useChatSession() {
   }, [
     storageReady,
     isHydrated,
+    toolsReady,
     prompt,
     isLoading,
     messages,
+    route,
     setPrompt,
     setIsLoading,
     setStatus,
@@ -213,15 +437,37 @@ export default function useChatSession() {
 
   const refreshInspector = useCallback(async () => {
     setInspectorLoading(true);
-    setInspectorStatus("scanning OPFS...");
+    setInspectorStatus("scanning OPFS + IndexedDB...");
     try {
-      const root = await getOpfsRoot();
-      const items = await walkOpfs(root);
+      const [root, allIndexedDb] = await Promise.all([
+        getOpfsRoot(),
+        listAllSkillMemoryRecords({ limitPerStore: 1000 }),
+      ]);
+
+      const opfsItems = await walkOpfs(root);
+
+      const indexedDbItems = Object.entries(allIndexedDb || {}).flatMap(
+        ([storeName, records]) => {
+          const safeRecords = Array.isArray(records) ? records : [];
+          return safeRecords.map((record, idx) => {
+            const recordId = String(record?.id ?? idx);
+            return {
+              kind: "file",
+              path: `indexeddb/${storeName}/${encodeURIComponent(recordId)}`,
+              name: `${storeName}:${recordId}`,
+            };
+          });
+        },
+      );
+
+      const items = [...opfsItems, ...indexedDbItems];
       setInspectorItems(items);
-      setInspectorStatus(`ready · ${items.length} entries`);
+      setInspectorStatus(
+        `ready · ${opfsItems.length} OPFS + ${indexedDbItems.length} IndexedDB records`,
+      );
     } catch (err) {
       setInspectorItems([]);
-      setInspectorStatus(`error · ${err instanceof Error ? err.message : "failed to scan OPFS"}`);
+      setInspectorStatus(`error · ${err instanceof Error ? err.message : "failed to scan storage"}`);
     } finally {
       setInspectorLoading(false);
     }
@@ -233,6 +479,33 @@ export default function useChatSession() {
       setSelectedFileContent("");
       setSelectedFileMeta(null);
       try {
+        const indexedDbPrefix = "indexeddb/";
+        if (String(path).startsWith(indexedDbPrefix)) {
+          const rest = String(path).slice(indexedDbPrefix.length);
+          const [storeName, ...idParts] = rest.split("/");
+          const recordId = decodeURIComponent(idParts.join("/"));
+
+          if (!storeName || !recordId) {
+            throw new Error("Invalid IndexedDB path");
+          }
+
+          const records = await listStoreRecords(storeName, { limit: 10_000, offset: 0 });
+          const payload = records.find((r) => String(r?.id) === String(recordId));
+
+          if (!payload) {
+            throw new Error(`IndexedDB record not found: ${storeName}/${recordId}`);
+          }
+
+          const text = JSON.stringify(payload, null, 2);
+          setSelectedFileContent(text);
+          setSelectedFileMeta({
+            size: new TextEncoder().encode(text).byteLength,
+            type: "application/json",
+            modified: payload?.updatedAt || payload?.createdAt || new Date().toISOString(),
+          });
+          return;
+        }
+
         const { file, text } = await readOpfsFileByPath(path);
         const json = parseJsonSafe(text, null);
         setSelectedFileContent(json ? JSON.stringify(json, null, 2) : text);

@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "registry::default",
+      "name": "sw_unified_knowledge_runtime",
+      "description": "Default unified retrieval-memory runtime (tool-only code)",
+      "version": 1,
+      "language": "javascript",
+      "entrypoint": "executeSkillTool",
+      "enabled": true,
+      "tools": [
+        {
+          "id": "tool::memory_ingest_url",
+          "name": "memory_ingest_url",
+          "enabled": true,
+          "code": "const url = String(args.url || \"\").trim();\nif (!url) throw new Error(\"url is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst tags = Array.isArray(args.tags) ? args.tags.map(String) : [];\nconst force = !!args.forceRefresh;\nconst res = await fetch(url, { cache: \"no-store\", mode: \"cors\" });\nif (!res.ok) throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);\nconst contentType = res.headers.get(\"content-type\") || \"\";\nconst raw = await res.text();\nconst text = contentType.includes(\"text/html\") ? kernel.stripHtmlToText(raw) : raw;\nconst db = await kernel.openDb();\nconst existing = await kernel.findDocBySource(db, scope, url);\nconst docId = existing?.id || kernel.randomId(\"doc\");\nconst createdAt = existing?.createdAt || kernel.nowIso();\nconst updatedAt = kernel.nowIso();\nconst chunks = kernel.chunkText(text);\nif (!chunks.length) throw new Error(\"No usable content after chunking\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nif (existing && force) await kernel.deleteChunksByDoc(chunksStore, docId);\ndocsStore.put({\n  id: docId, scope, sourceUrl: url, title: String(args.title || url), tags,\n  textLength: String(text || \"\").length, chunkCount: chunks.length, createdAt, updatedAt\n});\nfor (let i = 0; i < chunks.length; i += 1) {\n  const chunkText = chunks[i];\n  const tokens = kernel.tokenize(chunkText);\n  chunksStore.put({\n    id: `${docId}::${i}`, scope, docId, index: i, text: chunkText,\n    tokenFreq: kernel.freqMap(tokens), tokenCount: tokens.length, createdAt, updatedAt\n  });\n}\nawait kernel.txDone(tx);\nreturn { docId, sourceUrl: url, title: String(args.title || url), chunkCount: chunks.length, scope, updatedAt };"
+        },
+        {
+          "id": "tool::memory_ingest_text",
+          "name": "memory_ingest_text",
+          "enabled": true,
+          "code": "const text = kernel.normalizeText(args.text);\nif (!text) throw new Error(\"text is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst sourceUrl = String(args.url || \"\");\nconst title = String(args.title || \"Untitled note\");\nconst tags = Array.isArray(args.tags) ? args.tags.map(String) : [];\nconst db = await kernel.openDb();\nconst existing = sourceUrl ? await kernel.findDocBySource(db, scope, sourceUrl) : null;\nconst docId = existing?.id || kernel.randomId(\"doc\");\nconst createdAt = existing?.createdAt || kernel.nowIso();\nconst updatedAt = kernel.nowIso();\nconst chunks = kernel.chunkText(text);\nif (!chunks.length) throw new Error(\"No usable content after chunking\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nif (existing) await kernel.deleteChunksByDoc(chunksStore, docId);\ndocsStore.put({\n  id: docId, scope, sourceUrl: sourceUrl || null, title, tags,\n  textLength: String(text || \"\").length, chunkCount: chunks.length, createdAt, updatedAt\n});\nfor (let i = 0; i < chunks.length; i += 1) {\n  const chunkText = chunks[i];\n  const tokens = kernel.tokenize(chunkText);\n  chunksStore.put({\n    id: `${docId}::${i}`, scope, docId, index: i, text: chunkText,\n    tokenFreq: kernel.freqMap(tokens), tokenCount: tokens.length, createdAt, updatedAt\n  });\n}\nawait kernel.txDone(tx);\nreturn { docId, sourceUrl: sourceUrl || null, title, chunkCount: chunks.length, scope, updatedAt };"
+        },
+        {
+          "id": "tool::memory_query",
+          "name": "memory_query",
+          "enabled": true,
+          "code": "const query = kernel.normalizeText(args.query);\nif (!query) throw new Error(\"query is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst topK = Math.max(1, Math.min(20, Number(args.topK || 5)));\nconst db = await kernel.openDb();\nconst [chunks, docs] = await Promise.all([\n  kernel.getAllByIndex(db, kernel.stores.chunks, \"scope\", scope),\n  kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope)\n]);\nif (!chunks.length) return { query, scope, topK, totalChunks: 0, hits: [] };\nconst qTokens = kernel.tokenize(query);\nif (!qTokens.length) return { query, scope, topK, totalChunks: chunks.length, hits: [] };\nconst docMap = new Map(docs.map((d) => [d.id, d]));\nconst hits = [];\nfor (const c of chunks) {\n  const text = String(c.text || \"\").toLowerCase();\n  let score = 0;\n  for (const token of qTokens) if (text.includes(token)) score += 1;\n  if (score <= 0) continue;\n  const d = docMap.get(c.docId) || null;\n  hits.push({\n    score, docId: c.docId, chunkId: c.id, chunkIndex: c.index, text: c.text,\n    title: d?.title || null, sourceUrl: d?.sourceUrl || null, tags: d?.tags || []\n  });\n}\nhits.sort((a, b) => b.score - a.score);\nreturn { query, scope, topK, totalChunks: chunks.length, hits: hits.slice(0, topK) };"
+        },
+        {
+          "id": "tool::memory_list_documents",
+          "name": "memory_list_documents",
+          "enabled": true,
+          "code": "const tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst docs = await kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope);\ndocs.sort((a, b) => String(b.updatedAt || \"\").localeCompare(String(a.updatedAt || \"\")));\nreturn {\n  scope,\n  count: docs.length,\n  documents: docs.map((d) => ({\n    id: d.id, title: d.title, sourceUrl: d.sourceUrl, chunkCount: d.chunkCount,\n    tags: d.tags || [], updatedAt: d.updatedAt, createdAt: d.createdAt\n  }))\n};"
+        },
+        {
+          "id": "tool::memory_get_document",
+          "name": "memory_get_document",
+          "enabled": true,
+          "code": "const docId = String(args.docId || \"\").trim();\nif (!docId) throw new Error(\"docId is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nif (!doc || doc.scope !== scope) throw new Error(\"Document not found\");\nconst chunks = await kernel.getAllByIndex(db, kernel.stores.chunks, \"docId\", docId);\nchunks.sort((a, b) => (a.index || 0) - (b.index || 0));\nreturn {\n  document: doc,\n  chunks: chunks.map((c) => ({ id: c.id, index: c.index, text: c.text, tokenCount: c.tokenCount }))\n};"
+        },
+        {
+          "id": "tool::memory_delete_document",
+          "name": "memory_delete_document",
+          "enabled": true,
+          "code": "const docId = String(args.docId || \"\").trim();\nif (!docId) throw new Error(\"docId is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nif (!doc || doc.scope !== scope) throw new Error(\"Document not found\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\ntx.objectStore(kernel.stores.docs).delete(docId);\nawait kernel.deleteChunksByDoc(tx.objectStore(kernel.stores.chunks), docId);\nawait kernel.txDone(tx);\nreturn { ok: true, docId, scope };"
+        },
+        {
+          "id": "tool::memory_clear",
+          "name": "memory_clear",
+          "enabled": true,
+          "code": "const tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst [docs, chunks] = await Promise.all([\n  kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope),\n  kernel.getAllByIndex(db, kernel.stores.chunks, \"scope\", scope)\n]);\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nfor (const d of docs) docsStore.delete(d.id);\nfor (const c of chunks) chunksStore.delete(c.id);\nawait kernel.txDone(tx);\nreturn { ok: true, scope, deletedDocuments: docs.length, deletedChunks: chunks.length };"
+        }
+      ]
+    }
+  ]
+}

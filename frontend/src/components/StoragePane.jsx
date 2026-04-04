@@ -1,5 +1,26 @@
 import React from "react";
 
+function prettyPathLabel(path) {
+  const text = String(path || "");
+  if (!text.startsWith("indexeddb/")) return text;
+
+  const parts = text.split("/");
+  if (parts.length < 3) return text;
+
+  const [root, store, ...rest] = parts;
+  const decodedTail = rest
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join("/");
+
+  return `${root}/${store}/${decodedTail}`;
+}
+
 export default function StoragePane({
   inspectorItems = [],
   inspectorLoading = false,
@@ -66,7 +87,9 @@ export default function StoragePane({
           </button>
         </div>
 
-        <div style={{ color: "#93a6b7", fontSize: 12 }}>{inspectorStatus}</div>
+        <div style={{ color: "#93a6b7", fontSize: 12 }}>
+          storage index · {inspectorStatus}
+        </div>
 
         <div
           style={{
@@ -80,7 +103,9 @@ export default function StoragePane({
           }}
         >
           {inspectorItems.length === 0 ? (
-            <div style={{ color: "#6f8499" }}>No OPFS entries</div>
+            <div style={{ color: "#6f8499" }}>
+              No OPFS files or IndexedDB skill documents
+            </div>
           ) : (
             inspectorItems.map((item) => {
               const isFile = item.kind === "file";
@@ -91,6 +116,7 @@ export default function StoragePane({
                   key={item.path}
                   onClick={() => isFile && onViewFile?.(item.path)}
                   disabled={!isFile}
+                  title={item.path}
                   style={{
                     textAlign: "left",
                     border: "1px solid #2a394a",
@@ -100,9 +126,12 @@ export default function StoragePane({
                     padding: "6px 8px",
                     cursor: isFile ? "pointer" : "default",
                     opacity: isFile ? 1 : 0.8,
+                    whiteSpace: "normal",
+                    overflowWrap: "anywhere",
+                    wordBreak: "break-word",
                   }}
                 >
-                  {item.kind === "directory" ? "📁" : "📄"} {item.path}
+                  {item.kind === "directory" ? "📁" : "📄"} {prettyPathLabel(item.path)}
                 </button>
               );
             })
@@ -124,7 +153,9 @@ export default function StoragePane({
         }}
       >
         <div style={{ color: "#93a6b7", fontSize: 12 }}>
-          {selectedFilePath ? `viewing: ${selectedFilePath}` : "select a file to view its content"}
+          {selectedFilePath
+            ? `viewing: ${prettyPathLabel(selectedFilePath)}`
+            : "select an OPFS file or IndexedDB skill document to view its content"}
         </div>
 
         {selectedFileMeta ? (

@@ -35,7 +35,7 @@ class Settings(BaseSettings):
 
     # Agent behavior
     max_context_messages: int = Field(default=500, alias="MAX_CONTEXT_MESSAGES")
-    max_tool_rounds: int = Field(default=4, alias="MAX_TOOL_ROUNDS")
+    max_tool_rounds: int = Field(default=1, alias="MAX_TOOL_ROUNDS")
     request_timeout_seconds: int = Field(default=60, alias="REQUEST_TIMEOUT_SECONDS")
     compaction_trigger_total_tokens: int = Field(default=64_000, alias="COMPACTION_TRIGGER_TOTAL_TOKENS")
     compaction_target_total_tokens: int = Field(default=24_000, alias="COMPACTION_TARGET_TOTAL_TOKENS")
