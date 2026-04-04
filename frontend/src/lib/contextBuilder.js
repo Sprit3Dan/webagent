@@ -16,7 +16,6 @@ const BOOTSTRAP_FILES = [
   AGENT_TOOLS_FILE_NAME,
 ];
 
-const RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]";
 const CONTEXT_BOOTSTRAP_ENDPOINT = "/api/context/bootstrap";
 
 const DEFAULT_BOOTSTRAP_CONTENT = {
@@ -225,7 +224,7 @@ export function buildRuntimeMetadataBlock({
     }
   }
 
-  return `${RUNTIME_CONTEXT_TAG}\n${lines.join("\n")}`;
+  return lines.join("\n");
 }
 
 export function buildSystemPrompt({

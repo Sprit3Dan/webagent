@@ -33,8 +33,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     require_auth: bool = Field(default=False, alias="REQUIRE_AUTH")
 
+    # Web Push (VAPID)
+    web_push_enabled: bool = Field(default=False, alias="WEB_PUSH_ENABLED")
+    web_push_vapid_public_key: Optional[str] = Field(default=None, alias="WEB_PUSH_VAPID_PUBLIC_KEY")
+    web_push_vapid_private_key: Optional[str] = Field(default=None, alias="WEB_PUSH_VAPID_PRIVATE_KEY")
+    web_push_vapid_subject: Optional[str] = Field(default="mailto:admin@example.com", alias="WEB_PUSH_VAPID_SUBJECT")
+
     # Agent behavior
-    max_context_messages: int = Field(default=500, alias="MAX_CONTEXT_MESSAGES")
+
     max_tool_rounds: int = Field(default=1, alias="MAX_TOOL_ROUNDS")
     request_timeout_seconds: int = Field(default=60, alias="REQUEST_TIMEOUT_SECONDS")
     compaction_trigger_total_tokens: int = Field(default=64_000, alias="COMPACTION_TRIGGER_TOTAL_TOKENS")

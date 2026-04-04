@@ -425,37 +425,22 @@ function normalizeTools(tools) {
   const list = Array.isArray(tools) ? tools : [];
   const seen = new Set();
   const out = [];
-  const actionToMethod = {
-    ingest_url: "ingestUrl",
-    ingest_text: "ingestText",
-    query_memory: "queryMemory",
-    list_documents: "listDocuments",
-    get_document: "getDocument",
-    delete_document: "deleteDocument",
-    clear_memory: "clearMemory",
-  };
 
   for (const item of list) {
     const name = String(item?.name || "").trim();
     const code = String(item?.code || "").trim();
-    const action = String(item?.action || "").trim();
-    const inferredMethod = actionToMethod[action] || "";
-    const resolvedCode =
-      code || (inferredMethod
-        ? `return await modules.memory.${inferredMethod}(args, context, kernel);`
-        : "");
 
-    if (!name || !resolvedCode) continue;
+    if (!name || !code) continue;
     if (seen.has(name)) continue;
     seen.add(name);
 
     out.push({
       id: String(item?.id || `tool::${name}`),
       name,
-      code: resolvedCode,
+      code,
       moduleRefs: Array.isArray(item?.moduleRefs)
         ? item.moduleRefs.map((x) => String(x || "").trim()).filter(Boolean)
-        : ["memory"],
+        : [],
       enabled: item?.enabled !== false,
     });
   }
@@ -492,7 +477,9 @@ function normalizeSkill(input) {
   const actions = normalizeActions(input?.actions);
   const tools = normalizeTools(input?.tools);
 
-  const finalTools = tools.length ? tools : DEFAULT_RUNTIME_TOOLS.map((t) => ({ ...t }));
+  if (!tools.length) {
+    throw new Error("skill.tools must be a non-empty array with explicit code");
+  }
 
   return {
     name,
@@ -503,7 +490,7 @@ function normalizeSkill(input) {
     enabled: input?.enabled !== false,
     modules,
     actions,
-    tools: finalTools,
+    tools,
   };
 }
 

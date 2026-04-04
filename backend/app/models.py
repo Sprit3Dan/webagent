@@ -77,7 +77,7 @@ class AgentRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
     model: str | None = Field(default=None, min_length=1, max_length=256)
     temperature: float | None = Field(default=None, ge=0, le=2)
-    max_tokens: int | None = Field(default=None, alias="maxTokens", ge=1, le=16_384)
+    max_tokens: int | None = Field(default=None, alias="maxTokens", ge=1)
     stream: bool = True
     tools: list[ToolDefinition] | None = Field(default=None, max_length=MAX_TOOL_CALLS)
     metadata: dict[str, Any] | None = None

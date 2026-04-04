@@ -18,6 +18,49 @@ function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function repairLikelyTruncatedJsonObject(input) {
+  let text = String(input || "").trim();
+  if (!text.startsWith("{")) return text;
+
+  let inString = false;
+  let escaped = false;
+  let openCurly = 0;
+  let openSquare = 0;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === "\"") {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === "{") openCurly += 1;
+    else if (ch === "}") openCurly = Math.max(0, openCurly - 1);
+    else if (ch === "[") openSquare += 1;
+    else if (ch === "]") openSquare = Math.max(0, openSquare - 1);
+  }
+
+  if (inString) text += "\"";
+  if (openSquare > 0) text += "]".repeat(openSquare);
+  if (openCurly > 0) text += "}".repeat(openCurly);
+
+  // Remove trailing commas before closing braces/brackets.
+  return text.replace(/,\s*([}\]])/g, "$1");
+}
+
 function parseArgs(rawArgs) {
   if (rawArgs == null) return {};
   if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) return rawArgs;
@@ -28,18 +71,23 @@ function parseArgs(rawArgs) {
   const text = rawArgs.trim();
   if (!text) return {};
 
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error("Invalid JSON in tool arguments");
+  const repaired = repairLikelyTruncatedJsonObject(text);
+  const candidates = repaired !== text ? [text, repaired] : [text];
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed == null) return {};
+      if (typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Tool arguments JSON must decode to an object");
+      }
+      return parsed;
+    } catch {
+      // try next candidate
+    }
   }
 
-  if (parsed == null) return {};
-  if (typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Tool arguments JSON must decode to an object");
-  }
-  return parsed;
+  throw new Error("Invalid JSON in tool arguments");
 }
 
 const SUPPORTED_FRONTEND_TOOLS = new Set([
@@ -50,6 +98,9 @@ const SUPPORTED_FRONTEND_TOOLS = new Set([
   "memory_get_document",
   "memory_delete_document",
   "memory_clear",
+  "heartbeat_add_pending_item",
+  "heartbeat_list_pending_items",
+  "heartbeat_complete_pending_item",
 ]);
 
 const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
@@ -155,6 +206,50 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "heartbeat_add_pending_item",
+      description: "Add one pending heartbeat task item with a clear task title and detailed work description",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          description: { type: "string" },
+          priority: { type: "string", enum: ["low", "medium", "high"] },
+        },
+        required: ["text", "description"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "heartbeat_list_pending_items",
+      description: "List all pending heartbeat task items from markdown-backed list",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "heartbeat_complete_pending_item",
+      description: "Mark one pending heartbeat task item as completed in markdown-backed list",
+      parameters: {
+        type: "object",
+        properties: {
+          itemId: { type: "string" },
+        },
+        required: ["itemId"],
         additionalProperties: false,
       },
     },

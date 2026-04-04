@@ -17,9 +17,11 @@ import {
   loadFrontendToolDefinitionsFromOpfs,
   toFrontendToolMessage,
 } from "../lib/frontendTools";
+import { createAndRegisterSkill } from "../lib/skills";
 import {
   listAllSkillMemoryRecords,
   listStoreRecords,
+  readSkillDocument,
 } from "../lib/skillMemory";
 import {
   buildTelemetryText,
@@ -155,6 +157,7 @@ export default function useChatSession() {
     (async () => {
       try {
         await loadFrontendToolDefinitionsFromOpfs({ persistFallback: true });
+        await createAndRegisterSkill({ name: "sw_unified_knowledge_runtime" });
       } finally {
         if (active) setToolsReady(true);
       }
@@ -165,7 +168,7 @@ export default function useChatSession() {
     };
   }, []);
 
-  const send = useCallback(async () => {
+  const send = useCallback(async (inputText = null) => {
     if (!storageReady || !isHydrated) {
       setStatus("storage: OPFS not ready");
       return;
@@ -176,14 +179,17 @@ export default function useChatSession() {
       return;
     }
 
-    const text = prompt.trim();
+    const resolvedInput = typeof inputText === "string" ? inputText : prompt;
+    const text = resolvedInput.trim();
     if (!text || isLoading) return;
 
     const userMsg = makeUserMessage(text);
     const nextMessages = normalizeMessages([...messages, userMsg]);
 
     setMessages(nextMessages);
-    setPrompt("");
+    if (typeof inputText !== "string") {
+      setPrompt("");
+    }
     setIsLoading(true);
     setStatus("agent: loading");
 
@@ -205,6 +211,15 @@ export default function useChatSession() {
             workingMessages[workingMessages.length - 1]?.content || "",
           );
 
+          let heartbeatMemoryText = "";
+          try {
+            const heartbeatDoc = await readSkillDocument("system::heartbeat::pending-markdown");
+            heartbeatMemoryText =
+              typeof heartbeatDoc?.text === "string" ? heartbeatDoc.text : "";
+          } catch {
+            heartbeatMemoryText = "";
+          }
+
           const built = await buildContextForLlm({
             history: historyWithoutCurrent,
             currentMessage,
@@ -214,6 +229,9 @@ export default function useChatSession() {
             sessionId: CONTEXT.sessionId,
             route,
             page: route === ROUTES.STORAGE ? "storage" : "chat",
+            memoryText: heartbeatMemoryText
+              ? `## Heartbeat Pending Markdown\n\n${heartbeatMemoryText}`
+              : "",
           });
 
           requestMessages = built.messages;
@@ -233,6 +251,7 @@ export default function useChatSession() {
         };
 
         const streamAssistantId = `stream-assistant-${Date.now()}-${round}`;
+        const streamToolPreviewPrefix = `stream-tool-preview-${Date.now()}-${round}`;
         let liveContent = "";
         let liveReasoning = "";
         let liveToolCalls = null;
@@ -256,6 +275,34 @@ export default function useChatSession() {
               return next;
             }
             return [...prev, liveMessage];
+          });
+        };
+
+        const upsertLiveToolCallPreviews = (toolCalls) => {
+          const calls = Array.isArray(toolCalls) ? toolCalls : [];
+
+          setMessages((prev) => {
+            const base = prev.filter(
+              (m) => !String(m?.timestamp || "").startsWith(streamToolPreviewPrefix),
+            );
+
+            if (!calls.length) return base;
+
+            const previews = calls.map((call, idx) => {
+              const fn = call?.function || {};
+              const name = typeof fn?.name === "string" ? fn.name : "tool";
+              const rawArgs = typeof fn?.arguments === "string" ? fn.arguments.trim() : "";
+              const renderedArgs = rawArgs ? rawArgs.slice(0, 220) : "";
+              const suffix = renderedArgs ? ` ${renderedArgs}` : "";
+
+              return sanitizeMessage({
+                role: "tool",
+                content: `calling ${name}${suffix}`,
+                timestamp: `${streamToolPreviewPrefix}-${idx}`,
+              });
+            });
+
+            return [...base, ...previews];
           });
         };
 
@@ -293,6 +340,7 @@ export default function useChatSession() {
               if (payloadJson.type === "tool_calls" && Array.isArray(payloadJson.toolCalls)) {
                 liveToolCalls = payloadJson.toolCalls;
                 upsertLiveAssistant();
+                upsertLiveToolCallPreviews(liveToolCalls);
               }
             },
           },
@@ -397,9 +445,10 @@ export default function useChatSession() {
       }
 
       setMessages((prev) => [
-        ...prev.filter(
-          (m) => !String(m?.timestamp || "").startsWith("stream-assistant-"),
-        ),
+        ...prev.filter((m) => {
+          const ts = String(m?.timestamp || "");
+          return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
+        }),
         ...generatedAggregate,
       ]);
       setTelemetry({ usage, compaction });
@@ -410,9 +459,10 @@ export default function useChatSession() {
       setStatus(`agent: ready · ${modelName}${tokenPart}${compactPart}${toolPart}`);
     } catch (err) {
       setMessages((prev) => [
-        ...prev.filter(
-          (m) => !String(m?.timestamp || "").startsWith("stream-assistant-"),
-        ),
+        ...prev.filter((m) => {
+          const ts = String(m?.timestamp || "");
+          return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
+        }),
         sanitizeMessage({
           role: "assistant",
           content: `Error: ${err instanceof Error ? err.message : "unknown error"}`,
@@ -609,6 +659,34 @@ export default function useChatSession() {
   useEffect(() => {
     if (route === ROUTES.STORAGE) refreshInspector();
   }, [refreshInspector, route]);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return undefined;
+
+    const onSwMessage = (event) => {
+      const data = event?.data;
+      if (!data || typeof data !== "object") return;
+      if (data.type !== "heartbeat.assistant_note") return;
+
+      const note = data?.message || {};
+      const content = typeof note.content === "string" ? note.content.trim() : "";
+      if (!content) return;
+
+      const msg = sanitizeMessage({
+        role: "assistant",
+        content,
+        timestamp: note.timestamp || new Date().toISOString(),
+      });
+
+      setMessages((prev) => normalizeMessages([...prev, msg]));
+      setStatus("heartbeat: reviewed pending items");
+    };
+
+    navigator.serviceWorker.addEventListener("message", onSwMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener("message", onSwMessage);
+    };
+  }, [setStatus]);
 
   return {
     route,

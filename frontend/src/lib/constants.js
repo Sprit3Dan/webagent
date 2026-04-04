@@ -5,7 +5,7 @@ export const CONTEXT = {
   sessionId: "chat-001",
   model: "nemotron-30b",
   temperature: 0.2,
-  maxTokens: 1200,
+
 };
 
 export const SNAPSHOT_FILE_NAME =
