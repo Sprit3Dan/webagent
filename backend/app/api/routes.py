@@ -178,6 +178,20 @@ def _merge_tools(
     return merged
 
 
+def _metadata_openai_base_url(payload: AgentRequest) -> str | None:
+    metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
+    llm_provider = metadata.get("llmProvider")
+    if not isinstance(llm_provider, dict):
+        return None
+
+    base_url = llm_provider.get("baseUrl")
+    if not isinstance(base_url, str):
+        return None
+
+    cleaned = base_url.strip()
+    return cleaned or None
+
+
 def _sse_event(event: str, data: Any) -> str:
     payload = json.dumps(data, ensure_ascii=False, default=str)
     return f"event: {event}\ndata: {payload}\n\n"
@@ -411,7 +425,11 @@ async def _run_agent_response(
         )
 
     model_name = resolve_model(payload.model, settings)
-    client = get_async_openai_client(settings)
+    request_base_url = _metadata_openai_base_url(payload)
+    client = get_async_openai_client(
+        settings,
+        openai_base_url_override=request_base_url,
+    )
 
     working_messages: list[ChatMessage] = list(payload.messages)
     generated_messages: list[ChatMessage] = []
@@ -585,7 +603,11 @@ async def agent_respond_sse(
         )
 
     model_name = resolve_model(payload.model, settings)
-    client = get_async_openai_client(settings)
+    request_base_url = _metadata_openai_base_url(payload)
+    client = get_async_openai_client(
+        settings,
+        openai_base_url_override=request_base_url,
+    )
 
     openai_messages = to_openai_messages(
         list(payload.messages),

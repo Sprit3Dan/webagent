@@ -8,12 +8,17 @@ from openai import AsyncOpenAI, OpenAI
 from ..core.config import Settings, get_settings
 
 
-def _client_kwargs(settings: Settings) -> dict[str, Any]:
+def _client_kwargs(
+    settings: Settings,
+    *,
+    openai_base_url_override: str | None = None,
+) -> dict[str, Any]:
+    effective_base_url = (openai_base_url_override or "").strip() or settings.openai_base_url
     api_key = settings.openai_api_key
 
     # OpenAI-compatible backends behind custom base_url often do not require an API key.
     # The OpenAI SDK still expects one, so provide a harmless placeholder in that case.
-    if not api_key and settings.openai_base_url:
+    if not api_key and effective_base_url:
         api_key = "not-needed"
 
     if not api_key:
@@ -26,8 +31,8 @@ def _client_kwargs(settings: Settings) -> dict[str, Any]:
         "timeout": settings.request_timeout_seconds,
     }
 
-    if settings.openai_base_url:
-        kwargs["base_url"] = settings.openai_base_url
+    if effective_base_url:
+        kwargs["base_url"] = effective_base_url
 
     return kwargs
 
@@ -44,28 +49,50 @@ def _cached_async_openai_client() -> AsyncOpenAI:
     return AsyncOpenAI(**_client_kwargs(settings))
 
 
-def get_openai_client(settings: Settings | None = None) -> OpenAI:
+def get_openai_client(
+    settings: Settings | None = None,
+    *,
+    openai_base_url_override: str | None = None,
+) -> OpenAI:
     """
     Return a sync OpenAI client.
 
-    - Uses a cached singleton when called without explicit settings.
-    - Creates an uncached instance when explicit settings are provided.
+    - Uses a cached singleton when called without explicit settings and no base URL override.
+    - Creates an uncached instance when explicit settings are provided or a base URL override is set.
     """
-    if settings is None:
+    if settings is None and not (openai_base_url_override or "").strip():
         return _cached_openai_client()
-    return OpenAI(**_client_kwargs(settings))
+
+    cfg = settings or get_settings()
+    return OpenAI(
+        **_client_kwargs(
+            cfg,
+            openai_base_url_override=openai_base_url_override,
+        )
+    )
 
 
-def get_async_openai_client(settings: Settings | None = None) -> AsyncOpenAI:
+def get_async_openai_client(
+    settings: Settings | None = None,
+    *,
+    openai_base_url_override: str | None = None,
+) -> AsyncOpenAI:
     """
     Return an async OpenAI client.
 
-    - Uses a cached singleton when called without explicit settings.
-    - Creates an uncached instance when explicit settings are provided.
+    - Uses a cached singleton when called without explicit settings and no base URL override.
+    - Creates an uncached instance when explicit settings are provided or a base URL override is set.
     """
-    if settings is None:
+    if settings is None and not (openai_base_url_override or "").strip():
         return _cached_async_openai_client()
-    return AsyncOpenAI(**_client_kwargs(settings))
+
+    cfg = settings or get_settings()
+    return AsyncOpenAI(
+        **_client_kwargs(
+            cfg,
+            openai_base_url_override=openai_base_url_override,
+        )
+    )
 
 
 def resolve_model(request_model: str | None, settings: Settings | None = None) -> str:
