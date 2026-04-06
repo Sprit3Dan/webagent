@@ -30,6 +30,13 @@
         reasoning: typeof (input && input.reasoning) === "string"
           ? input.reasoning
           : undefined,
+        prompt_memories: Array.isArray(input && input.prompt_memories)
+          ? input.prompt_memories
+          : undefined,
+        prompt_memory_meta:
+          input && input.prompt_memory_meta && typeof input.prompt_memory_meta === "object"
+            ? input.prompt_memory_meta
+            : undefined,
       };
     }
 

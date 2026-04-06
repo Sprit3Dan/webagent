@@ -32,6 +32,10 @@ export const LLM_PROVIDER_SETTINGS_TITLE = "LLM Provider Settings";
 
 const DEFAULT_SCOPE = "tenant-dev::user-001::default";
 
+export const CONVERSATION_MEMORY_SCOPE_PREFIX = "conversation-memory";
+export const CONVERSATION_MEMORY_DOC_KIND = "conversation_turn";
+export const CONVERSATION_MEMORY_FACT_KIND = "conversation_fact";
+
 const reqToPromise = runtimeShared.dbReqToPromise;
 const txDone = runtimeShared.dbTxDone;
 
@@ -45,6 +49,41 @@ export function buildSkillScope({
   sessionId = "default",
 } = {}) {
   return `${String(tenantId)}::${String(userId)}::${String(sessionId)}`;
+}
+
+export function buildConversationMemoryScope({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+} = {}) {
+  return [
+    CONVERSATION_MEMORY_SCOPE_PREFIX,
+    String(tenantId),
+    String(userId),
+    String(agentId),
+  ].join("::");
+}
+
+export function isConversationMemoryScope(scope) {
+  return String(scope || "").startsWith(`${CONVERSATION_MEMORY_SCOPE_PREFIX}::`);
+}
+
+export function buildConversationTurnMemoryId({
+  sessionId = "default",
+  turnIndex = 0,
+} = {}) {
+  const safeTurnIndex = Math.max(0, Number(turnIndex) || 0);
+  return `memory::conversation::${String(sessionId)}::turn::${safeTurnIndex}`;
+}
+
+export function buildConversationFactMemoryId({
+  sessionId = "default",
+  turnIndex = 0,
+  factIndex = 0,
+} = {}) {
+  const safeTurnIndex = Math.max(0, Number(turnIndex) || 0);
+  const safeFactIndex = Math.max(0, Number(factIndex) || 0);
+  return `memory::conversation::${String(sessionId)}::fact::${safeTurnIndex}::${safeFactIndex}`;
 }
 
 export async function openSkillMemoryDb() {
@@ -277,6 +316,338 @@ export async function readSkillMemorySummary({ scope = DEFAULT_SCOPE } = {}) {
     skills,
     tools,
   };
+}
+
+function normalizeVector(input) {
+  if (!Array.isArray(input)) return [];
+  const out = [];
+  for (const v of input) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    out.push(n);
+  }
+  return out;
+}
+
+function cosineSimilarity(a, b) {
+  const v1 = normalizeVector(a);
+  const v2 = normalizeVector(b);
+  if (!v1.length || !v2.length || v1.length !== v2.length) return 0;
+
+  let dot = 0;
+  let n1 = 0;
+  let n2 = 0;
+  for (let i = 0; i < v1.length; i += 1) {
+    const x = v1[i];
+    const y = v2[i];
+    dot += x * y;
+    n1 += x * x;
+    n2 += y * y;
+  }
+
+  if (!n1 || !n2) return 0;
+  return dot / (Math.sqrt(n1) * Math.sqrt(n2));
+}
+
+function buildTurnMemoryText({ userText = "", assistantText = "" } = {}) {
+  const u = String(userText || "").trim();
+  const a = String(assistantText || "").trim();
+
+  return [
+    "## Prior Conversation Turn",
+    "",
+    u ? `User: ${u}` : "User:",
+    "",
+    a ? `Assistant: ${a}` : "Assistant:",
+  ].join("\n");
+}
+
+export async function writeConversationTurnMemory({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  sessionId = "default",
+  turnIndex = 0,
+  userText = "",
+  assistantText = "",
+  userEmbedding = [],
+  assistantEmbedding = [],
+  embeddingModel = "",
+} = {}) {
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, SKILL_DOCS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${SKILL_DOCS_STORE}`);
+  }
+
+  const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
+  const id = buildConversationTurnMemoryId({ sessionId, turnIndex });
+  const now = new Date().toISOString();
+  const existing = await readSkillDocument(id);
+
+  const normalizedUserEmbedding = normalizeVector(userEmbedding);
+  const normalizedAssistantEmbedding = normalizeVector(assistantEmbedding);
+  const dimensions =
+    normalizedUserEmbedding.length ||
+    normalizedAssistantEmbedding.length ||
+    0;
+
+
+
+  const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+  tx.objectStore(SKILL_DOCS_STORE).put({
+    id,
+    scope,
+    kind: CONVERSATION_MEMORY_DOC_KIND,
+    title: `Conversation Turn ${Number(turnIndex) || 0}`,
+    sessionId: String(sessionId),
+    turnIndex: Math.max(0, Number(turnIndex) || 0),
+    text: buildTurnMemoryText({ userText, assistantText }),
+    userText: String(userText || ""),
+    assistantText: String(assistantText || ""),
+    userEmbedding: normalizedUserEmbedding,
+    assistantEmbedding: normalizedAssistantEmbedding,
+    embeddingModel: String(embeddingModel || ""),
+    dimensions,
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  });
+  await txDone(tx);
+
+  return {
+    id,
+    scope,
+    sessionId: String(sessionId),
+    turnIndex: Math.max(0, Number(turnIndex) || 0),
+    dimensions,
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  };
+}
+
+export async function writeConversationFactMemories({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  sessionId = "default",
+  turnIndex = 0,
+  embeddingModel = "",
+  facts = [],
+} = {}) {
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, SKILL_DOCS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${SKILL_DOCS_STORE}`);
+  }
+
+  const normalizedFacts = (Array.isArray(facts) ? facts : [])
+    .map((item, idx) => {
+      const text = String(item?.text || "").trim();
+      const embedding = normalizeVector(item?.embedding);
+      if (!text || !embedding.length) return null;
+      return {
+        id: buildConversationFactMemoryId({ sessionId, turnIndex, factIndex: idx }),
+        text,
+        embedding,
+      };
+    })
+    .filter(Boolean);
+
+  if (!normalizedFacts.length) {
+    return {
+      scope: buildConversationMemoryScope({ tenantId, userId, agentId }),
+      sessionId: String(sessionId),
+      turnIndex: Math.max(0, Number(turnIndex) || 0),
+      stored: 0,
+      skipped: true,
+    };
+  }
+
+  const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
+  const safeTurnIndex = Math.max(0, Number(turnIndex) || 0);
+  const now = new Date().toISOString();
+  const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+  const store = tx.objectStore(SKILL_DOCS_STORE);
+
+  for (let i = 0; i < normalizedFacts.length; i += 1) {
+    const fact = normalizedFacts[i];
+    // eslint-disable-next-line no-await-in-loop
+    const existing = await readSkillDocument(fact.id);
+    store.put({
+      id: fact.id,
+      scope,
+      kind: CONVERSATION_MEMORY_FACT_KIND,
+      title: `Conversation Fact ${safeTurnIndex}:${i}`,
+      sessionId: String(sessionId),
+      turnIndex: safeTurnIndex,
+      factIndex: i,
+      text: fact.text,
+      embedding: fact.embedding,
+      embeddingModel: String(embeddingModel || ""),
+      dimensions: fact.embedding.length,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    });
+  }
+
+  await txDone(tx);
+
+  return {
+    scope,
+    sessionId: String(sessionId),
+    turnIndex: safeTurnIndex,
+    stored: normalizedFacts.length,
+    skipped: false,
+    updatedAt: now,
+  };
+}
+
+export async function listConversationTurnMemories({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  limit = 200,
+  offset = 0,
+  sortDesc = true,
+} = {}) {
+  const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
+  const docs = await listSkillDocuments({
+    scope,
+    limit: 10_000,
+    offset: 0,
+    sortDesc,
+  });
+
+  const turns = docs.filter(
+    (doc) => String(doc?.kind || "") === CONVERSATION_MEMORY_DOC_KIND,
+  );
+
+  turns.sort((a, b) => {
+    const ai = Number(a?.turnIndex || 0);
+    const bi = Number(b?.turnIndex || 0);
+    return sortDesc ? bi - ai : ai - bi;
+  });
+
+  return pageArray(turns, { limit, offset });
+}
+
+export async function searchConversationMemoryKnn({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  queryEmbedding = [],
+  topK = 12,
+  minScore = 0.7,
+} = {}) {
+  const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
+  const query = normalizeVector(queryEmbedding);
+
+  if (!query.length) {
+    return {
+      scope,
+      topK: Math.max(1, Number(topK) || 1),
+      minScore: Number(minScore) || 0,
+      totalCandidates: 0,
+      hits: [],
+    };
+  }
+
+  const docs = await listSkillDocuments({
+    scope,
+    limit: 10_000,
+    offset: 0,
+    sortDesc: true,
+  });
+
+  const candidates = docs.filter((doc) => {
+    const kind = String(doc?.kind || "");
+    return kind === CONVERSATION_MEMORY_DOC_KIND || kind === CONVERSATION_MEMORY_FACT_KIND;
+  });
+
+  const scored = candidates.map((doc) => {
+    const kind = String(doc?.kind || "");
+
+    if (kind === CONVERSATION_MEMORY_FACT_KIND) {
+      const factScore = cosineSimilarity(query, doc?.embedding || []);
+      return {
+        id: String(doc?.id || ""),
+        score: factScore,
+        kind,
+        turnIndex: Number(doc?.turnIndex || 0),
+        sessionId: String(doc?.sessionId || ""),
+        text: String(doc?.text || ""),
+        userText: "",
+        assistantText: "",
+        factText: String(doc?.text || ""),
+        updatedAt: String(doc?.updatedAt || doc?.createdAt || ""),
+        source: doc,
+      };
+    }
+
+    const userScore = cosineSimilarity(query, doc?.userEmbedding || []);
+    const assistantScore = cosineSimilarity(query, doc?.assistantEmbedding || []);
+    const score = Math.max(userScore, assistantScore);
+
+    return {
+      id: String(doc?.id || ""),
+      score,
+      kind,
+      turnIndex: Number(doc?.turnIndex || 0),
+      sessionId: String(doc?.sessionId || ""),
+      text: String(doc?.text || ""),
+      userText: String(doc?.userText || ""),
+      assistantText: String(doc?.assistantText || ""),
+      factText: "",
+      updatedAt: String(doc?.updatedAt || doc?.createdAt || ""),
+      source: doc,
+    };
+  });
+
+  const threshold = Number(minScore) || 0;
+  const safeTopK = Math.max(1, Number(topK) || 1);
+
+  const hits = scored
+    .filter((item) => item.score >= threshold)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, safeTopK);
+
+  return {
+    scope,
+    topK: safeTopK,
+    minScore: threshold,
+    totalCandidates: candidates.length,
+    hits,
+  };
+}
+
+export function buildConversationMemoryPromptBlock(hits) {
+  const list = Array.isArray(hits) ? hits : [];
+  if (!list.length) return "";
+
+  const lines = ["## Relevant Prior Memories", "", "We had related conversations before:"];
+
+  for (let i = 0; i < list.length; i += 1) {
+    const item = list[i];
+    const score = Number(item?.score || 0).toFixed(3);
+    const sessionId = String(item?.sessionId || "");
+    const turnIndex = Math.max(0, Number(item?.turnIndex || 0));
+    const userText = String(item?.userText || "").replace(/\s+/g, " ").trim();
+    const assistantText = String(item?.assistantText || "").replace(/\s+/g, " ").trim();
+    const factText = String(item?.factText || "").replace(/\s+/g, " ").trim();
+    const kind = String(item?.kind || "");
+
+    lines.push(`- [score=${score}] session=${sessionId} turn=${turnIndex} kind=${kind}`);
+
+    if (factText) {
+      lines.push(`  - fact: ${factText.slice(0, 280)}`);
+      continue;
+    }
+
+    lines.push(
+      `  - user: ${userText.slice(0, 280)}`,
+      `  - assistant: ${assistantText.slice(0, 280)}`,
+    );
+  }
+
+  return lines.join("\n").trim();
 }
 
 export async function closeSkillMemoryDb() {

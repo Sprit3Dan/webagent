@@ -2,6 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App.jsx";
 import "./styles.css";
+import {
+  WEBGPU_EMBEDDINGS_DEFAULTS,
+  benchmarkEmbeddingLatency,
+  getWebGpuAdapterName,
+  isWebGpuSupported,
+} from "./lib/webgpuEmbeddings";
 
 function urlBase64ToUint8Array(base64String) {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
@@ -98,6 +104,51 @@ async function registerWebPushSubscription(registration) {
 
 
 
+function shouldRunWebGpuEmbeddingDiagnostics() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const raw = String(params.get("wgpuEmbedDiag") || "").trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "yes";
+  } catch {
+    return false;
+  }
+}
+
+async function runStartupWebGpuEmbeddingDiagnostics() {
+  if (!shouldRunWebGpuEmbeddingDiagnostics()) return;
+
+  console.groupCollapsed("[embed:webgpu] startup diagnostics");
+  try {
+    console.info("[embed:webgpu] model defaults", WEBGPU_EMBEDDINGS_DEFAULTS);
+
+    if (!isWebGpuSupported()) {
+      console.warn("[embed:webgpu] WebGPU is not supported in this browser/runtime");
+      return;
+    }
+
+    const adapterName = await getWebGpuAdapterName();
+    console.info("[embed:webgpu] adapter", adapterName || "unknown");
+
+    const report = await benchmarkEmbeddingLatency({
+      texts: [
+        "webagent diagnostics warmup sentence",
+        "this is an english-only embedding benchmark sample",
+        "local vector generation should stay on device",
+      ],
+      runs: 5,
+      warmupRuns: 1,
+      model: WEBGPU_EMBEDDINGS_DEFAULTS.model,
+      device: WEBGPU_EMBEDDINGS_DEFAULTS.device,
+    });
+
+    console.info("[embed:webgpu] benchmark", report);
+  } catch (err) {
+    console.error("[embed:webgpu] diagnostics failed", err);
+  } finally {
+    console.groupEnd();
+  }
+}
+
 async function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) {
     console.warn("[sw] service workers are not supported in this browser");
@@ -119,6 +170,7 @@ async function registerServiceWorker() {
 }
 
 void registerServiceWorker();
+void runStartupWebGpuEmbeddingDiagnostics();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

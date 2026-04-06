@@ -19,9 +19,12 @@ import {
 } from "../lib/frontendTools";
 import { createAndRegisterSkill } from "../lib/skills";
 import {
+  buildConversationMemoryPromptBlock,
   listAllSkillMemoryRecords,
   listStoreRecords,
   readSkillDocument,
+  searchConversationMemoryKnn,
+  writeConversationFactMemories,
 } from "../lib/skillMemory";
 import {
   buildTelemetryText,
@@ -34,6 +37,173 @@ import {
   sanitizeMessage,
 } from "../lib/chatState";
 import { buildContextForLlm } from "../lib/contextBuilder";
+import { WEBGPU_EMBEDDINGS_DEFAULTS, embedText } from "../lib/webgpuEmbeddings";
+
+const SLIDING_WINDOW_ROUNDS = 10;
+const MEMORY_KNN_TOP_K = 12;
+const MEMORY_MIN_SCORE_FLOOR = 0.72;
+const MEMORY_SCORE_MARGIN_FROM_TOP = 0.08;
+const MEMORY_MAX_PROMPT_HITS = 8;
+const MEMORY_EMBED_MODEL = WEBGPU_EMBEDDINGS_DEFAULTS.model;
+const MEMORY_EMBED_DEVICE = WEBGPU_EMBEDDINGS_DEFAULTS.device;
+const FACT_EXTRACTION_MAX_FACTS = 3;
+const FACT_EXTRACTION_MIN_USER_CHARS = 12;
+
+function pickSlidingWindowMessages(messages, rounds = SLIDING_WINDOW_ROUNDS) {
+  const all = normalizeMessages(Array.isArray(messages) ? messages : []);
+  if (!all.length) return [];
+
+  const targetMessages = Math.max(1, Number(rounds) || SLIDING_WINDOW_ROUNDS);
+  const hasSystemPrefix = String(all[0]?.role || "") === "system";
+  const prefix = hasSystemPrefix ? [all[0]] : [];
+  const body = hasSystemPrefix ? all.slice(1) : all;
+
+  if (body.length <= targetMessages) {
+    return normalizeMessages([...prefix, ...body]);
+  }
+
+  const slicedBody = body.slice(-targetMessages);
+  return normalizeMessages([...prefix, ...slicedBody]);
+}
+
+function summarizeMemoryHits(hits) {
+  const list = Array.isArray(hits) ? hits : [];
+  if (!list.length) {
+    return {
+      count: 0,
+      topScore: 0,
+      avgScore: 0,
+      sessions: [],
+      turnIndexes: [],
+    };
+  }
+
+  const scores = list.map((item) => Number(item?.score || 0));
+  const avgScore = scores.reduce((acc, n) => acc + n, 0) / scores.length;
+  const sessions = Array.from(
+    new Set(list.map((item) => String(item?.sessionId || "")).filter(Boolean)),
+  ).slice(0, 6);
+  const turnIndexes = list
+    .map((item) => Number(item?.turnIndex || 0))
+    .filter((n) => Number.isFinite(n))
+    .slice(0, 10);
+
+  return {
+    count: list.length,
+    topScore: Math.max(...scores),
+    avgScore,
+    sessions,
+    turnIndexes,
+  };
+}
+
+function logMemoryRetrieval({
+  queryText = "",
+  hits = [],
+  minScore = MEMORY_MIN_SCORE_FLOOR,
+  topK = MEMORY_KNN_TOP_K,
+  durationMs = 0,
+} = {}) {
+  const summary = summarizeMemoryHits(hits);
+  console.info("[memory:knn] retrieval", {
+    queryPreview: String(queryText || "").slice(0, 120),
+    minScore,
+    topK,
+    durationMs: Number(durationMs) || 0,
+    hitCount: summary.count,
+    topScore: summary.topScore,
+    avgScore: summary.avgScore,
+    sessions: summary.sessions,
+    turnIndexes: summary.turnIndexes,
+  });
+}
+
+async function extractMajorUserFactsWithLlm({
+  userText = "",
+  selectedLlmProvider = null,
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  sessionId = "default",
+} = {}) {
+  const text = String(userText || "").trim();
+  if (text.length < FACT_EXTRACTION_MIN_USER_CHARS) return [];
+
+  const systemPrompt = [
+    "Extract only major, durable user facts from the message.",
+    "Return strict JSON object: {\"facts\":[\"...\"]}.",
+    `Include at most ${FACT_EXTRACTION_MAX_FACTS} facts.`,
+    "Do not include transient requests like 'more' or short acknowledgements.",
+    "If no major facts, return {\"facts\":[]}.",
+  ].join(" ");
+
+  const payload = {
+    tenantId,
+    userId,
+    agentId,
+    sessionId,
+    model: String(selectedLlmProvider?.model || CONTEXT.model || "").trim() || CONTEXT.model,
+    stream: false,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: text },
+    ],
+    metadata: {
+      llmProvider: {
+        id: String(selectedLlmProvider?.id || ""),
+        name: String(selectedLlmProvider?.name || ""),
+        provider: String(selectedLlmProvider?.provider || ""),
+        baseUrl: String(selectedLlmProvider?.baseUrl || ""),
+      },
+    },
+  };
+
+  try {
+    const res = await fetch("/api/agent/respond", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-tenant-id": tenantId,
+        "x-user-id": userId,
+        "x-agent-id": agentId,
+      },
+      credentials: "same-origin",
+      mode: "same-origin",
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) return [];
+
+    const data = await res.json();
+    const raw = String(data?.message?.content || "").trim();
+    if (!raw) return [];
+
+    const normalized = raw
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+
+    const parsed = parseJsonSafe(normalized, null) || parseJsonSafe(raw, null);
+    const facts = Array.isArray(parsed?.facts) ? parsed.facts : [];
+
+    const deduped = [];
+    const seen = new Set();
+    for (const item of facts) {
+      const fact = String(item || "").replace(/\s+/g, " ").trim();
+      if (!fact) continue;
+      const key = fact.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(fact);
+      if (deduped.length >= FACT_EXTRACTION_MAX_FACTS) break;
+    }
+
+    return deduped;
+  } catch {
+    return [];
+  }
+}
 
 export default function useChatSession() {
   const {
@@ -278,12 +448,18 @@ export default function useChatSession() {
       let modelName = effectiveModel;
       let executedTools = 0;
       let systemContextMessage = null;
+      let promptMemoriesForAssistant = [];
+      let promptMemoryMetaForAssistant = null;
 
       for (let round = 0; round < 4; round += 1) {
         let requestMessages = workingMessages;
 
         if (round === 0) {
           const historyWithoutCurrent = workingMessages.slice(0, -1);
+          const slidingWindowHistory = pickSlidingWindowMessages(
+            historyWithoutCurrent,
+            SLIDING_WINDOW_ROUNDS,
+          );
           const currentMessage = String(
             workingMessages[workingMessages.length - 1]?.content || "",
           );
@@ -297,16 +473,90 @@ export default function useChatSession() {
             heartbeatMemoryText = "";
           }
 
+          let memoryHits = [];
+          let memoryRetrievalMs = 0;
+          try {
+            const t0 =
+              typeof performance !== "undefined" && typeof performance.now === "function"
+                ? performance.now()
+                : Date.now();
+
+            const queryEmbedding = await embedText(currentMessage, {
+              model: MEMORY_EMBED_MODEL,
+              device: MEMORY_EMBED_DEVICE,
+            });
+
+            const knn = await searchConversationMemoryKnn({
+              tenantId: CONTEXT.tenantId,
+              userId: CONTEXT.userId,
+              agentId: CONTEXT.agentId,
+              queryEmbedding: queryEmbedding.embedding,
+              topK: MEMORY_KNN_TOP_K,
+              minScore: MEMORY_MIN_SCORE_FLOOR,
+            });
+
+            memoryRetrievalMs =
+              (typeof performance !== "undefined" && typeof performance.now === "function"
+                ? performance.now()
+                : Date.now()) - t0;
+
+            const rawHits = Array.isArray(knn?.hits) ? knn.hits : [];
+            const topScore = rawHits.length
+              ? Math.max(...rawHits.map((item) => Number(item?.score || 0)))
+              : 0;
+            const adaptiveMinScore = Math.max(
+              MEMORY_MIN_SCORE_FLOOR,
+              topScore - MEMORY_SCORE_MARGIN_FROM_TOP,
+            );
+
+            memoryHits = rawHits
+              .filter((item) => Number(item?.score || 0) >= adaptiveMinScore)
+              .slice(0, MEMORY_MAX_PROMPT_HITS);
+
+            promptMemoriesForAssistant = memoryHits;
+            promptMemoryMetaForAssistant = {
+              minScore: adaptiveMinScore,
+              topK: MEMORY_KNN_TOP_K,
+              retrievalMs: memoryRetrievalMs,
+              hitCount: memoryHits.length,
+            };
+
+            logMemoryRetrieval({
+              queryText: currentMessage,
+              hits: memoryHits,
+              minScore: adaptiveMinScore,
+              topK: MEMORY_KNN_TOP_K,
+              durationMs: memoryRetrievalMs,
+            });
+          } catch (err) {
+            console.warn(
+              "[memory:knn] retrieval failed",
+              err instanceof Error ? err.message : "unknown error",
+            );
+          }
+
+          const memoryPromptBlock = buildConversationMemoryPromptBlock(memoryHits);
+          const memorySections = [];
+          if (heartbeatMemoryText) {
+            memorySections.push(`## Heartbeat Pending Markdown\n\n${heartbeatMemoryText}`);
+          }
+          if (memoryPromptBlock) {
+            memorySections.push(memoryPromptBlock);
+          }
+
           const opfsMemoryPolicyText = [
             "## Persistence Policy",
             "- Store frequently-needed user facts, agent identity, and operating process in OPFS context files via opfs_* tools.",
             "- Use `USER.md` for user profile and preferences, `SOUL.md` for stable agent behavior, `AGENTS.md` for process/runbook, `TOOLS.md` for tool instructions.",
             "- IndexedDB memory tools are long-term retrieval memory only and may not be injected into every prompt.",
             "- If new information should be reliably present in future prompts, persist it to OPFS first; optionally mirror to IndexedDB for long-term recall.",
+            "- Grounding rule: if asked about prior conversation and no retrieved memory evidence is provided, do not claim certainty or recall; state that memory evidence is unavailable in the current context.",
+            "- When memory evidence exists, prefer citing those retrieved memories over assumptions.",
+
           ].join("\n");
 
           const built = await buildContextForLlm({
-            history: historyWithoutCurrent,
+            history: slidingWindowHistory,
             currentMessage,
             tenantId: CONTEXT.tenantId,
             userId: CONTEXT.userId,
@@ -314,26 +564,46 @@ export default function useChatSession() {
             sessionId: CONTEXT.sessionId,
             route,
             page: route === ROUTES.STORAGE ? "storage" : "chat",
-            memoryText: heartbeatMemoryText
-              ? `## Heartbeat Pending Markdown\n\n${heartbeatMemoryText}`
-              : "",
+            memoryText: memorySections.join("\n\n"),
             skillsText: opfsMemoryPolicyText,
           });
 
           requestMessages = built.messages;
           systemContextMessage = built.messages[0] || null;
         } else if (systemContextMessage) {
+          const slidingWindowFollowUp = pickSlidingWindowMessages(
+            workingMessages,
+            SLIDING_WINDOW_ROUNDS,
+          );
           requestMessages = normalizeMessages([
             systemContextMessage,
-            ...workingMessages,
+            ...slidingWindowFollowUp,
           ]);
         }
+
+        const requestMessagesWindowed = pickSlidingWindowMessages(
+          requestMessages,
+          SLIDING_WINDOW_ROUNDS,
+        );
+
+        const requestRoleCounts = requestMessagesWindowed.reduce((acc, msg) => {
+          const role = String(msg?.role || "unknown");
+          acc[role] = (acc[role] || 0) + 1;
+          return acc;
+        }, {});
+
+        console.info("[context:sliding-window]", {
+          round,
+          totalMessages: requestMessagesWindowed.length,
+          roleCounts: requestRoleCounts,
+          slidingWindowRounds: SLIDING_WINDOW_ROUNDS,
+        });
 
         const payload = {
           ...CONTEXT,
           model: effectiveModel,
           stream: false,
-          messages: requestMessages,
+          messages: requestMessagesWindowed,
           tools: listFrontendToolDefinitions(),
           metadata: {
             llmProvider: {
@@ -493,7 +763,21 @@ export default function useChatSession() {
 
         const normalizedGenerated = generated
           .filter(Boolean)
-          .map((m) => sanitizeMessage(m));
+          .map((m) => {
+            const sanitized = sanitizeMessage(m);
+            const role = String(sanitized?.role || "").toLowerCase();
+
+            if (role !== "assistant") return sanitized;
+            if (!Array.isArray(promptMemoriesForAssistant) || !promptMemoriesForAssistant.length) {
+              return sanitized;
+            }
+
+            return sanitizeMessage({
+              ...sanitized,
+              prompt_memories: promptMemoriesForAssistant,
+              prompt_memory_meta: promptMemoryMetaForAssistant || undefined,
+            });
+          });
 
         if (!normalizedGenerated.length) break;
 
@@ -569,10 +853,78 @@ export default function useChatSession() {
       });
       setTelemetry({ usage, compaction });
 
+      let memoryQueued = false;
+      try {
+        const turnIndex = Math.max(
+          0,
+          nextMessages.filter((m) => String(m?.role || "") === "user").length - 1,
+        );
+
+        memoryQueued = true;
+
+        void (async () => {
+          try {
+            const factTexts = await extractMajorUserFactsWithLlm({
+              userText: text,
+              selectedLlmProvider,
+              tenantId: CONTEXT.tenantId,
+              userId: CONTEXT.userId,
+              agentId: CONTEXT.agentId,
+              sessionId: CONTEXT.sessionId,
+            });
+
+            if (!factTexts.length) {
+              console.info("[memory:facts] no major facts extracted");
+              return;
+            }
+
+            const facts = await Promise.all(
+              factTexts.map(async (factText) => {
+                const vec = await embedText(factText, {
+                  model: MEMORY_EMBED_MODEL,
+                  device: MEMORY_EMBED_DEVICE,
+                });
+
+                return {
+                  text: factText,
+                  embedding: vec.embedding,
+                };
+              }),
+            );
+
+            await writeConversationFactMemories({
+              tenantId: CONTEXT.tenantId,
+              userId: CONTEXT.userId,
+              agentId: CONTEXT.agentId,
+              sessionId: CONTEXT.sessionId,
+              turnIndex,
+              embeddingModel: MEMORY_EMBED_MODEL,
+              facts,
+            });
+
+            console.info("[memory:facts] stored", {
+              turnIndex,
+              count: facts.length,
+            });
+          } catch (err) {
+            console.warn(
+              "[memory:facts] background extraction failed",
+              err instanceof Error ? err.message : "unknown error",
+            );
+          }
+        })();
+      } catch (err) {
+        console.warn(
+          "[memory:facts] queue failed",
+          err instanceof Error ? err.message : "unknown error",
+        );
+      }
+
       const tokenPart = typeof usage?.totalTokens === "number" ? ` · ${usage.totalTokens} tok` : "";
       const compactPart = compaction?.triggered ? ` · compacted ${compaction?.droppedMessages ?? 0}` : "";
       const toolPart = executedTools > 0 ? ` · tools ${executedTools}` : "";
-      setStatus(`agent: ready · ${modelName}${tokenPart}${compactPart}${toolPart}`);
+      const memoryPart = memoryQueued ? " · memory queued" : "";
+      setStatus(`agent: ready · ${modelName}${tokenPart}${compactPart}${toolPart}${memoryPart}`);
     } catch (err) {
       setMessages((prev) => [
         ...prev.filter((m) => {

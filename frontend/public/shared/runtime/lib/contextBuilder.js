@@ -81,9 +81,6 @@ You are webagent, a frontend-first assistant with service-worker tools.
 - Language: ${lang}
 
 ## Scope
-- tenantId: ${tenantId}
-- userId: ${userId}
-- agentId: ${agentId}
 - sessionId: ${sessionId}`;
     }
 
@@ -98,11 +95,6 @@ You are webagent, a frontend-first assistant with service-worker tools.
     } = {}) {
       const lines = [
         `Current Time: ${RuntimeUtils.nowIso()}`,
-        `Route: ${route}`,
-        `Page: ${page}`,
-        `tenantId: ${tenantId || ""}`,
-        `userId: ${userId || ""}`,
-        `agentId: ${agentId || ""}`,
         `sessionId: ${sessionId || ""}`,
       ];
 
