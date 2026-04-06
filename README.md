@@ -1,10 +1,18 @@
 # webagent
 
-Frontend-first assistant app with:
+## Mission
 
-- **Backend**: FastAPI (`backend/`)
-- **Frontend**: Vite + React (`frontend/`)
-- **Runtime tools**: service-worker skill runtime with OPFS + IndexedDB memory
+Build a frontend-first, tool-using web agent with explicit trust boundaries:
+
+- **Local-first data boundary**: user context and working memory stay on-device (OPFS + IndexedDB in the browser runtime).
+- **Inference boundary**: model calls go only to configured OpenAI-compatible endpoints; the app does not require central storage of user data.
+- **Operational boundary**: backend orchestrates request/response flow and tool-call routing, while frontend/service worker owns local state and persistence.
+
+## Architecture at a Glance
+
+- **Backend**: FastAPI (`backend/`) for API surface, auth/multitenant scope checks, and OpenAI-compatible chat completion calls
+- **Frontend**: Vite + React (`frontend/`) for chat UX and runtime controls
+- **Runtime tools**: service-worker skill runtime with OPFS (fast prompt-path context) + IndexedDB (long-term retrieval memory)
 - **Dev containers**: Docker Compose (`docker-compose.dev.yml`)
 
 ---
@@ -76,29 +84,6 @@ Or run via helper script:
 chmod +x ./dev-start.sh
 ./dev-start.sh
 ```
-
----
-
-## Environment Notes
-
-This repo now uses a **single shared env file** for both frontend and backend.
-
-1. Copy the shared template:
-cp .env.example .env
-
-2. Edit values in root `.env` as needed.
-
-Key points:
-- Frontend reads env from the repo root (`frontend/vite.config.js` uses `envDir: ".."`).
-- Backend loads env from root `.env` first (with local fallback).
-- Docker Compose already reads `./.env` at the repo root.
-
-Common vars in `.env.example`:
-- `VITE_BACKEND_URL`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
-- `OPENAI_BASE_URL`
-- `WEB_PUSH_*` (optional)
 
 ---
 
