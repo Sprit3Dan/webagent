@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 function isEditableTarget(target) {
   const tag = target?.tagName?.toLowerCase?.() || "";
@@ -10,6 +10,8 @@ function isEditableTarget(target) {
 export default function useChatKeyboard({
   route,
   chatRoute = "/",
+  routes = { chat: "/", storage: "/storage", settings: "/settings" },
+  onNavigate,
   currentPageLength = 0,
   isOnLastPage = true,
   setFocusedMessageIndex,
@@ -21,15 +23,62 @@ export default function useChatKeyboard({
   setStatus,
   isEnabled = true,
 }) {
+  const pendingGoRef = useRef({ active: false, ts: 0 });
+
   useEffect(() => {
     if (!isEnabled) return;
-    if (route !== chatRoute) return;
 
     const onWindowKeydown = (event) => {
       if (event.defaultPrevented) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
 
-      if (isEditableTarget(event.target)) return;
+      const key = String(event.key || "").toLowerCase();
+      const editable = isEditableTarget(event.target);
+      const now = Date.now();
+
+      if (key === "escape") {
+        const active = document.activeElement;
+        if (active && isEditableTarget(active) && typeof active.blur === "function") {
+          event.preventDefault();
+          active.blur();
+          setStatus?.("input unfocused");
+          return;
+        }
+      }
+
+      if (pendingGoRef.current.active && now - pendingGoRef.current.ts > 1200) {
+        pendingGoRef.current = { active: false, ts: 0 };
+      }
+
+      if (!editable && key === "g") {
+        event.preventDefault();
+        pendingGoRef.current = { active: true, ts: now };
+        setStatus?.("go: c=chat · s=storage · ,=settings");
+        return;
+      }
+
+      if (!editable && pendingGoRef.current.active) {
+        pendingGoRef.current = { active: false, ts: 0 };
+
+        if (key === "c") {
+          event.preventDefault();
+          onNavigate?.(routes.chat || "/");
+          return;
+        }
+        if (key === "s") {
+          event.preventDefault();
+          onNavigate?.(routes.storage || "/storage");
+          return;
+        }
+        if (key === ",") {
+          event.preventDefault();
+          onNavigate?.(routes.settings || "/settings");
+          return;
+        }
+      }
+
+      if (editable) return;
+      if (route !== chatRoute) return;
 
       if (event.key === "/") {
         event.preventDefault();
@@ -100,6 +149,8 @@ export default function useChatKeyboard({
     isEnabled,
     route,
     chatRoute,
+    routes,
+    onNavigate,
     currentPageLength,
     isOnLastPage,
     setFocusedMessageIndex,

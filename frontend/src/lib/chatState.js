@@ -1,17 +1,14 @@
+const runtimeShared = globalThis?.WebagentRuntimeShared;
+if (!runtimeShared) {
+  throw new Error("Shared runtime module is required");
+}
+
 export function nowIso() {
-  return new Date().toISOString();
+  return runtimeShared.nowIso();
 }
 
 export function sanitizeMessage(message, fallbackRole = "assistant") {
-  return {
-    role: message?.role || fallbackRole,
-    content: typeof message?.content === "string" ? message.content : "",
-    name: message?.name || undefined,
-    tool_call_id: message?.tool_call_id || undefined,
-    tool_calls: Array.isArray(message?.tool_calls) ? message.tool_calls : undefined,
-    reasoning: typeof message?.reasoning === "string" ? message.reasoning : undefined,
-    timestamp: message?.timestamp || nowIso(),
-  };
+  return runtimeShared.sanitizeMessage(message, fallbackRole);
 }
 
 export function makeUserMessage(content) {
@@ -64,8 +61,7 @@ export function derivePagination(messages, pageIndex, pageSize) {
 }
 
 export function normalizeMessages(input) {
-  if (!Array.isArray(input)) return [];
-  return input.map((m) => sanitizeMessage(m));
+  return runtimeShared.normalizeMessages(input);
 }
 
 export function buildTelemetryText(telemetry) {

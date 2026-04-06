@@ -21,6 +21,60 @@ function prettyPathLabel(path) {
   return `${root}/${store}/${decodedTail}`;
 }
 
+function classifyStorageItem(item) {
+  const path = String(item?.path || "");
+  const kind = String(item?.kind || "");
+
+  if (kind === "directory") return "opfs_directories";
+
+  if (path.startsWith("indexeddb/tools/")) return "idb_tools";
+  if (path.startsWith("indexeddb/skills/")) return "idb_skills";
+  if (path.startsWith("indexeddb/docs/")) return "idb_docs";
+  if (path.startsWith("indexeddb/chunks/")) return "idb_chunks";
+  if (path.startsWith("indexeddb/")) return "idb_other";
+
+  if (["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"].includes(path)) return "opfs_context";
+  if (path.endsWith(".json")) return "opfs_snapshots";
+  return "opfs_other";
+}
+
+function buildInspectorSections(items) {
+  const order = [
+    "opfs_context",
+    "opfs_snapshots",
+    "opfs_other",
+    "opfs_directories",
+    "idb_tools",
+    "idb_skills",
+    "idb_docs",
+    "idb_chunks",
+    "idb_other",
+  ];
+
+  const titles = {
+    opfs_context: "OPFS · Context Files",
+    opfs_snapshots: "OPFS · Session Snapshots",
+    opfs_other: "OPFS · Other Files",
+    opfs_directories: "OPFS · Directories",
+    idb_tools: "IndexedDB · Tools",
+    idb_skills: "IndexedDB · Skills",
+    idb_docs: "IndexedDB · Docs",
+    idb_chunks: "IndexedDB · Chunks",
+    idb_other: "IndexedDB · Other Records",
+  };
+
+  const buckets = new Map(order.map((k) => [k, []]));
+  for (const item of Array.isArray(items) ? items : []) {
+    const key = classifyStorageItem(item);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(item);
+  }
+
+  return order
+    .map((key) => ({ key, title: titles[key] || key, items: buckets.get(key) || [] }))
+    .filter((section) => section.items.length > 0);
+}
+
 export default function StoragePane({
   inspectorItems = [],
   inspectorLoading = false,
@@ -32,6 +86,8 @@ export default function StoragePane({
   onClearSession,
   onViewFile,
 }) {
+  const inspectorSections = buildInspectorSections(inspectorItems);
+
   return (
     <section
       style={{
@@ -102,39 +158,57 @@ export default function StoragePane({
             gap: 4,
           }}
         >
-          {inspectorItems.length === 0 ? (
+          {inspectorSections.length === 0 ? (
             <div style={{ color: "#6f8499" }}>
               No OPFS files or IndexedDB skill documents
             </div>
           ) : (
-            inspectorItems.map((item) => {
-              const isFile = item.kind === "file";
-              const selected = selectedFilePath === item.path;
+            inspectorSections.map((section, sectionIdx) => (
+              <div
+                key={section.key}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  paddingTop: sectionIdx === 0 ? 0 : 8,
+                  marginTop: sectionIdx === 0 ? 0 : 8,
+                  borderTop: sectionIdx === 0 ? "none" : "1px solid #233240",
+                }}
+              >
+                <div style={{ color: "#8fb0c9", fontSize: 11, letterSpacing: "0.02em" }}>
+                  {section.title}
+                </div>
 
-              return (
-                <button
-                  key={item.path}
-                  onClick={() => isFile && onViewFile?.(item.path)}
-                  disabled={!isFile}
-                  title={item.path}
-                  style={{
-                    textAlign: "left",
-                    border: "1px solid #2a394a",
-                    borderRadius: 6,
-                    background: selected ? "#16314f" : "#111b27",
-                    color: isFile ? "#cfe0ef" : "#7e93a8",
-                    padding: "6px 8px",
-                    cursor: isFile ? "pointer" : "default",
-                    opacity: isFile ? 1 : 0.8,
-                    whiteSpace: "normal",
-                    overflowWrap: "anywhere",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  {item.kind === "directory" ? "📁" : "📄"} {prettyPathLabel(item.path)}
-                </button>
-              );
-            })
+                {section.items.map((item) => {
+                  const isFile = item.kind === "file";
+                  const selected = selectedFilePath === item.path;
+
+                  return (
+                    <button
+                      key={item.path}
+                      onClick={() => isFile && onViewFile?.(item.path)}
+                      disabled={!isFile}
+                      title={item.path}
+                      style={{
+                        textAlign: "left",
+                        border: "1px solid #2a394a",
+                        borderRadius: 6,
+                        background: selected ? "#16314f" : "#111b27",
+                        color: isFile ? "#cfe0ef" : "#7e93a8",
+                        padding: "6px 8px",
+                        cursor: isFile ? "pointer" : "default",
+                        opacity: isFile ? 1 : 0.8,
+                        whiteSpace: "normal",
+                        overflowWrap: "anywhere",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {item.kind === "directory" ? "📁" : "📄"} {prettyPathLabel(item.path)}
+                    </button>
+                  );
+                })}
+              </div>
+            ))
           )}
         </div>
       </aside>

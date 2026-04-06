@@ -6,6 +6,11 @@ const SKILL_LANGUAGE = "javascript";
 const SKILL_ENTRYPOINT = "executeSkillAction";
 const ACTION_EXECUTOR_JS = "js_code";
 
+const runtimeShared = globalThis?.WebagentRuntimeShared;
+if (!runtimeShared) {
+  throw new Error("Shared runtime module is required");
+}
+
 const DEFAULT_MEMORY_MODULE_CODE = [
   'exports.resolveScope = (context = {}, args = {}) => {',
   '  const tenantId = String(args.tenantId || context.tenantId || "tenant-dev");',
@@ -286,79 +291,18 @@ const DEFAULT_RUNTIME_TOOLS = [
 ];
 
 function nowIso() {
-  return new Date().toISOString();
+  return runtimeShared.nowIso();
 }
 
 function randomId(prefix = "skill") {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return `${prefix}_${crypto.randomUUID()}`;
-  }
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function withTimeout(promise, timeoutMs = DEFAULT_TIMEOUT_MS, label = "request") {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
-    promise
-      .then((value) => {
-        clearTimeout(timer);
-        resolve(value);
-      })
-      .catch((err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-  });
-}
-
-async function ensureServiceWorkerReady() {
-  if (!("serviceWorker" in navigator)) {
-    throw new Error("Service Worker is not supported in this browser");
-  }
-
-  let registration = await navigator.serviceWorker.getRegistration();
-  if (!registration) {
-    registration = await navigator.serviceWorker.register(SW_PATH);
-  }
-
-  await navigator.serviceWorker.ready;
-
-  const worker =
-    navigator.serviceWorker.controller ||
-    registration.active ||
-    registration.waiting ||
-    registration.installing;
-
-  if (!worker) {
-    throw new Error("Service worker is not active yet. Reload and retry.");
-  }
-
-  return worker;
+  return runtimeShared.randomId(prefix);
 }
 
 async function sendToServiceWorker(payload, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-  const worker = await ensureServiceWorkerReady();
-
-  const task = new Promise((resolve, reject) => {
-    const channel = new MessageChannel();
-
-    channel.port1.onmessage = (event) => {
-      const data = event?.data || {};
-      if (data?.ok === false) {
-        reject(new Error(data?.error || "Service worker request failed"));
-        return;
-      }
-      resolve(data);
-    };
-
-    try {
-      worker.postMessage(payload, [channel.port2]);
-    } catch (err) {
-      reject(err);
-    }
+  return runtimeShared.sendToServiceWorker(payload, {
+    timeoutMs,
+    swPath: SW_PATH,
   });
-
-  return withTimeout(task, timeoutMs, payload?.type || "service-worker call");
 }
 
 function normalizeActions(actions) {

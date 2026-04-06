@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useMemo, useState } from "react";
 import {
+  CONTEXT,
   ROUTES,
   VIEWPORT_PAGE_MAX_MESSAGES,
   VIEWPORT_PAGE_MIN_MESSAGES,
@@ -37,6 +38,20 @@ export function AppProvider({ children }) {
   const [autoScroll, setAutoScroll] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
 
+  const [llmProviders, setLlmProviders] = useState(() => [
+    {
+      id: "default",
+      name: "default",
+      provider: "openai-compatible",
+      baseUrl: "",
+      model: String(CONTEXT.model || "nemotron-30b"),
+      contextWindowTokens: Number(CONTEXT.contextWindowTokens || 64_000),
+      tokenBudget: 0,
+      tokenSecret: "",
+    },
+  ]);
+  const [activeLlmProviderId, setActiveLlmProviderId] = useState("default");
+
   const [pageIndex, setPageIndex] = useState(0);
   const [pageSize, setPageSize] = useState(() => getViewportPageSize());
   const [focusedMessageIndex, setFocusedMessageIndex] = useState(-1);
@@ -65,6 +80,12 @@ export function AppProvider({ children }) {
       setAutoScroll,
       isLoading,
       setIsLoading,
+      llmProviders,
+      setLlmProviders,
+      activeLlmProviderId,
+      setActiveLlmProviderId,
+      activeLlmProvider:
+        llmProviders.find((p) => p?.id === activeLlmProviderId) || llmProviders[0] || null,
       pageIndex,
       setPageIndex,
       pageSize,
@@ -90,6 +111,8 @@ export function AppProvider({ children }) {
       status,
       autoScroll,
       isLoading,
+      llmProviders,
+      activeLlmProviderId,
       pageIndex,
       pageSize,
       focusedMessageIndex,

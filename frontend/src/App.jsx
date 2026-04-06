@@ -1,6 +1,7 @@
 import React from "react";
 import ChatPane from "./components/ChatPane";
 import StoragePane from "./components/StoragePane";
+import SettingsPane from "./components/SettingsPane";
 import TopBar from "./components/TopBar";
 import { AppProvider } from "./context/AppContext";
 import useChatKeyboard from "./hooks/useChatKeyboard";
@@ -43,11 +44,24 @@ function AppShell() {
     refreshInspector,
     viewFile,
     clearCurrentSession,
+    llmProviders,
+    activeLlmProviderId,
+    setActiveLlmProviderId,
+    updateActiveLlmProvider,
+    addLlmProvider,
+    removeLlmProvider,
+    saveLlmSettings,
   } = useChatSession();
 
   useChatKeyboard({
     route,
     chatRoute: ROUTES.CHAT,
+    routes: {
+      chat: ROUTES.CHAT,
+      storage: ROUTES.STORAGE,
+      settings: ROUTES.SETTINGS,
+    },
+    onNavigate: navigate,
     currentPageLength: currentPage.length,
     isOnLastPage,
     setFocusedMessageIndex,
@@ -83,6 +97,9 @@ function AppShell() {
         status={status}
         inspectorStatus={inspectorStatus}
         telemetryText={telemetryText}
+        llmProviders={llmProviders}
+        activeLlmProviderId={activeLlmProviderId}
+        onActiveLlmProviderChange={setActiveLlmProviderId}
       />
 
       {route === ROUTES.CHAT ? (
@@ -103,6 +120,16 @@ function AppShell() {
           onSend={send}
           composerDisabled={composerDisabled}
           composerPlaceholder="Type your message. Enter=send, Shift+Enter=newline, swipe L/R for pages"
+        />
+      ) : route === ROUTES.SETTINGS ? (
+        <SettingsPane
+          llmProviders={llmProviders}
+          activeLlmProviderId={activeLlmProviderId}
+          onActiveLlmProviderChange={setActiveLlmProviderId}
+          onUpdateActiveProvider={updateActiveLlmProvider}
+          onAddProvider={addLlmProvider}
+          onRemoveProvider={removeLlmProvider}
+          onSave={saveLlmSettings}
         />
       ) : (
         <StoragePane

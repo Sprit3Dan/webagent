@@ -12,45 +12,31 @@
  *   - tools:         "name", "enabled"
  */
 
-export const SKILL_DB_NAME = "webagent-skills-db";
-export const SKILL_DB_VERSION = 3;
-export const SKILL_DOCS_STORE = "docs";
-export const SKILL_CHUNKS_STORE = "chunks";
-export const SKILL_SKILLS_STORE = "skills";
+const runtimeShared = globalThis?.WebagentRuntimeShared;
+if (!runtimeShared) {
+  throw new Error("Shared runtime facade is required");
+}
+
+export const SKILL_DB_NAME = runtimeShared.RuntimeDbRegistry.DB_NAME;
+export const SKILL_DB_VERSION = runtimeShared.RuntimeDbRegistry.DB_VERSION;
+export const SKILL_DOCS_STORE = runtimeShared.RuntimeDbRegistry.DOCS_STORE;
+export const SKILL_CHUNKS_STORE = runtimeShared.RuntimeDbRegistry.CHUNKS_STORE;
+export const SKILL_SKILLS_STORE = runtimeShared.RuntimeDbRegistry.SKILLS_STORE;
 export const SKILL_MODULES_STORE = "skill_modules";
-export const SKILL_TOOLS_STORE = "tools";
+export const SKILL_TOOLS_STORE = runtimeShared.RuntimeDbRegistry.TOOLS_STORE;
+
+export const LLM_SETTINGS_STORE = SKILL_DOCS_STORE;
+export const LLM_PROVIDER_SETTINGS_DOC_ID = "system::settings::llm-providers";
+export const LLM_PROVIDER_SETTINGS_SCOPE = "system::settings";
+export const LLM_PROVIDER_SETTINGS_TITLE = "LLM Provider Settings";
 
 const DEFAULT_SCOPE = "tenant-dev::user-001::default";
 
-let dbPromise = null;
-
-function assertIndexedDbAvailable() {
-  if (typeof indexedDB === "undefined") {
-    throw new Error("IndexedDB is not available in this environment");
-  }
-}
-
-function reqToPromise(request) {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
-  });
-}
-
-function txDone(tx) {
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
-    tx.onerror = () => reject(tx.error || new Error("IndexedDB transaction failed"));
-  });
-}
+const reqToPromise = runtimeShared.dbReqToPromise;
+const txDone = runtimeShared.dbTxDone;
 
 function hasStore(db, storeName) {
   return db.objectStoreNames.contains(storeName);
-}
-
-function hasIndex(store, indexName) {
-  return store.indexNames.contains(indexName);
 }
 
 export function buildSkillScope({
@@ -62,54 +48,7 @@ export function buildSkillScope({
 }
 
 export async function openSkillMemoryDb() {
-  assertIndexedDbAvailable();
-  if (dbPromise) return dbPromise;
-
-  dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(SKILL_DB_NAME, SKILL_DB_VERSION);
-
-    req.onupgradeneeded = () => {
-      const db = req.result;
-
-      if (!db.objectStoreNames.contains(SKILL_DOCS_STORE)) {
-        const docs = db.createObjectStore(SKILL_DOCS_STORE, { keyPath: "id" });
-        docs.createIndex("scope", "scope", { unique: false });
-        docs.createIndex("sourceUrl", "sourceUrl", { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(SKILL_CHUNKS_STORE)) {
-        const chunks = db.createObjectStore(SKILL_CHUNKS_STORE, { keyPath: "id" });
-        chunks.createIndex("scope", "scope", { unique: false });
-        chunks.createIndex("docId", "docId", { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(SKILL_SKILLS_STORE)) {
-        const skills = db.createObjectStore(SKILL_SKILLS_STORE, { keyPath: "id" });
-        skills.createIndex("name", "name", { unique: false });
-        skills.createIndex("enabled", "enabled", { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(SKILL_MODULES_STORE)) {
-        const modules = db.createObjectStore(SKILL_MODULES_STORE, { keyPath: "id" });
-        modules.createIndex("skillId", "skillId", { unique: false });
-        modules.createIndex("name", "name", { unique: false });
-        modules.createIndex("enabled", "enabled", { unique: false });
-      }
-
-
-
-      if (!db.objectStoreNames.contains(SKILL_TOOLS_STORE)) {
-        const tools = db.createObjectStore(SKILL_TOOLS_STORE, { keyPath: "id" });
-        tools.createIndex("name", "name", { unique: false });
-        tools.createIndex("enabled", "enabled", { unique: false });
-      }
-    };
-
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error("Failed to open skill memory DB"));
-  });
-
-  return dbPromise;
+  return runtimeShared.openDb();
 }
 
 function normalizePagination({ limit = 100, offset = 0 } = {}) {
@@ -124,27 +63,11 @@ function pageArray(items, { limit = 100, offset = 0 } = {}) {
 }
 
 async function getAllByIndex(db, storeName, indexName, value) {
-  const tx = db.transaction(storeName, "readonly");
-  const store = tx.objectStore(storeName);
-
-  if (!hasIndex(store, indexName)) {
-    await txDone(tx);
-    return [];
-  }
-
-  const index = store.index(indexName);
-  const req = index.getAll(IDBKeyRange.only(value));
-  const out = await reqToPromise(req);
-  await txDone(tx);
-  return Array.isArray(out) ? out : [];
+  return runtimeShared.dbGetAllByIndex(db, storeName, indexName, value);
 }
 
 async function getAllByStore(db, storeName) {
-  const tx = db.transaction(storeName, "readonly");
-  const req = tx.objectStore(storeName).getAll();
-  const out = await reqToPromise(req);
-  await txDone(tx);
-  return Array.isArray(out) ? out : [];
+  return runtimeShared.dbGetAllByStore(db, storeName);
 }
 
 export async function listIndexedDbStores() {
@@ -235,6 +158,80 @@ export async function readSkillDocument(docId) {
   return doc || null;
 }
 
+function normalizeProviderRecord(input, index = 0) {
+  const id = String(input?.id || `provider-${index + 1}`);
+  return {
+    id,
+    name: String(input?.name || id),
+    provider: String(input?.provider || "openai-compatible"),
+    baseUrl: String(input?.baseUrl || ""),
+    model: String(input?.model || ""),
+    contextWindowTokens: Math.max(1, Number(input?.contextWindowTokens) || 64000),
+    tokenBudget: Math.max(0, Number(input?.tokenBudget) || 0),
+    tokenSecret: String(input?.tokenSecret || ""),
+  };
+}
+
+function normalizeProviderSettingsPayload(input) {
+  const rawProviders = Array.isArray(input?.providers) ? input.providers : [];
+  const providers = rawProviders.map((item, idx) => normalizeProviderRecord(item, idx));
+  const activeProviderId = String(input?.activeProviderId || providers[0]?.id || "");
+  return { providers, activeProviderId };
+}
+
+export async function readPersistedLlmProviderSettings() {
+  const doc = await readSkillDocument(LLM_PROVIDER_SETTINGS_DOC_ID);
+  if (!doc?.text) {
+    return {
+      providers: [],
+      activeProviderId: "",
+      updatedAt: null,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(String(doc.text || "{}"));
+    const normalized = normalizeProviderSettingsPayload(parsed);
+    return {
+      ...normalized,
+      updatedAt: doc.updatedAt || doc.createdAt || null,
+    };
+  } catch {
+    return {
+      providers: [],
+      activeProviderId: "",
+      updatedAt: doc.updatedAt || doc.createdAt || null,
+    };
+  }
+}
+
+export async function writePersistedLlmProviderSettings(input) {
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, LLM_SETTINGS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${LLM_SETTINGS_STORE}`);
+  }
+
+  const normalized = normalizeProviderSettingsPayload(input || {});
+  const now = new Date().toISOString();
+  const existing = await readSkillDocument(LLM_PROVIDER_SETTINGS_DOC_ID);
+
+  const tx = db.transaction(LLM_SETTINGS_STORE, "readwrite");
+  tx.objectStore(LLM_SETTINGS_STORE).put({
+    id: LLM_PROVIDER_SETTINGS_DOC_ID,
+    scope: LLM_PROVIDER_SETTINGS_SCOPE,
+    title: LLM_PROVIDER_SETTINGS_TITLE,
+    text: JSON.stringify(normalized, null, 2),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  });
+  await txDone(tx);
+
+  return {
+    ...normalized,
+    updatedAt: now,
+  };
+}
+
 export async function readSkillDocumentWithChunks(docId) {
   if (!docId) throw new Error("docId is required");
 
@@ -283,8 +280,14 @@ export async function readSkillMemorySummary({ scope = DEFAULT_SCOPE } = {}) {
 }
 
 export async function closeSkillMemoryDb() {
-  if (!dbPromise) return;
-  const db = await dbPromise;
-  db.close();
-  dbPromise = null;
+  try {
+    const db = await runtimeShared.openDb();
+    db.close();
+  } catch {
+    // no-op
+  } finally {
+    if (runtimeShared.RuntimeDbRegistry) {
+      runtimeShared.RuntimeDbRegistry._dbPromise = null;
+    }
+  }
 }

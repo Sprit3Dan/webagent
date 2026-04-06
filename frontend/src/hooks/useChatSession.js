@@ -45,6 +45,11 @@ export default function useChatSession() {
     setStatus,
     isLoading,
     setIsLoading,
+    llmProviders,
+    setLlmProviders,
+    activeLlmProviderId,
+    setActiveLlmProviderId,
+    activeLlmProvider,
     pageIndex,
     setPageIndex,
     pageSize,
@@ -81,7 +86,18 @@ export default function useChatSession() {
 
   const { pages, lastPageIndex, safePageIndex, currentPage, isOnLastPage } = pagination;
   const telemetryText = useMemo(() => buildTelemetryText(telemetry), [telemetry]);
-  const composerDisabled = !storageReady || !isHydrated || !toolsReady || isLoading;
+  const composerDisabled = !storageReady || !isHydrated || !toolsReady;
+  const selectedLlmProvider = useMemo(() => {
+    const providers = Array.isArray(llmProviders) ? llmProviders : [];
+    if (!providers.length) return null;
+    return (
+      providers.find(
+        (provider) => String(provider?.id || "") === String(activeLlmProviderId || ""),
+      ) ||
+      activeLlmProvider ||
+      providers[0]
+    );
+  }, [activeLlmProvider, activeLlmProviderId, llmProviders]);
 
   const navigate = useCallback(
     (nextRoute) => {
@@ -100,7 +116,60 @@ export default function useChatSession() {
     setPageIndex(clamp(safePageIndex + 1, 0, lastPageIndex));
   }, [safePageIndex, lastPageIndex, setPageIndex]);
 
+  const updateActiveLlmProvider = useCallback(
+    (patch = {}) => {
+      const targetId = String(
+        activeLlmProviderId ||
+          (Array.isArray(llmProviders) && llmProviders.length ? llmProviders[0]?.id : ""),
+      );
 
+      setLlmProviders((prev) => {
+        const list = Array.isArray(prev) ? prev : [];
+        return list.map((provider) =>
+          String(provider?.id || "") === targetId ? { ...provider, ...patch } : provider,
+        );
+      });
+    },
+    [activeLlmProviderId, llmProviders, setLlmProviders],
+  );
+
+  const addLlmProvider = useCallback(() => {
+    const providerId = `provider-${Date.now()}`;
+    const nextProvider = {
+      id: providerId,
+      name: `provider-${(Array.isArray(llmProviders) ? llmProviders.length : 0) + 1}`,
+      provider: "openai-compatible",
+      baseUrl: "",
+      model: String(CONTEXT.model || "nemotron-30b"),
+      contextWindowTokens: Number(CONTEXT.contextWindowTokens || 64_000),
+      tokenBudget: 0,
+      tokenSecret: "",
+    };
+
+    setLlmProviders((prev) => [...(Array.isArray(prev) ? prev : []), nextProvider]);
+    setActiveLlmProviderId(providerId);
+  }, [llmProviders, setActiveLlmProviderId, setLlmProviders]);
+
+  const removeLlmProvider = useCallback(
+    (providerId) => {
+      const list = Array.isArray(llmProviders) ? llmProviders : [];
+      if (list.length <= 1) return;
+
+      const targetId = String(providerId || activeLlmProviderId || "");
+      const filtered = list.filter((provider) => String(provider?.id || "") !== targetId);
+      if (!filtered.length) return;
+
+      setLlmProviders(filtered);
+      if (String(activeLlmProviderId || "") === targetId) {
+        setActiveLlmProviderId(String(filtered[0]?.id || ""));
+      }
+    },
+    [activeLlmProviderId, llmProviders, setActiveLlmProviderId, setLlmProviders],
+  );
+
+  const saveLlmSettings = useCallback(() => {
+    setStatus("settings: saved");
+  }, [setStatus]);
 
   const focusComposer = useCallback(() => {
     const el = document.querySelector('textarea[aria-label="New message"]');
@@ -181,7 +250,7 @@ export default function useChatSession() {
 
     const resolvedInput = typeof inputText === "string" ? inputText : prompt;
     const text = resolvedInput.trim();
-    if (!text || isLoading) return;
+    if (!text) return;
 
     const userMsg = makeUserMessage(text);
     const nextMessages = normalizeMessages([...messages, userMsg]);
@@ -198,7 +267,15 @@ export default function useChatSession() {
       let generatedAggregate = [];
       let usage = null;
       let compaction = null;
-      let modelName = CONTEXT.model;
+      const effectiveModel =
+        String(selectedLlmProvider?.model || CONTEXT.model || "").trim() || CONTEXT.model;
+      const effectiveContextWindowTokens = Math.max(
+        1,
+        Number(
+          selectedLlmProvider?.contextWindowTokens || CONTEXT?.contextWindowTokens || 64_000,
+        ) || 64_000,
+      );
+      let modelName = effectiveModel;
       let executedTools = 0;
       let systemContextMessage = null;
 
@@ -220,6 +297,14 @@ export default function useChatSession() {
             heartbeatMemoryText = "";
           }
 
+          const opfsMemoryPolicyText = [
+            "## Persistence Policy",
+            "- Store frequently-needed user facts, agent identity, and operating process in OPFS context files via opfs_* tools.",
+            "- Use `USER.md` for user profile and preferences, `SOUL.md` for stable agent behavior, `AGENTS.md` for process/runbook, `TOOLS.md` for tool instructions.",
+            "- IndexedDB memory tools are long-term retrieval memory only and may not be injected into every prompt.",
+            "- If new information should be reliably present in future prompts, persist it to OPFS first; optionally mirror to IndexedDB for long-term recall.",
+          ].join("\n");
+
           const built = await buildContextForLlm({
             history: historyWithoutCurrent,
             currentMessage,
@@ -232,6 +317,7 @@ export default function useChatSession() {
             memoryText: heartbeatMemoryText
               ? `## Heartbeat Pending Markdown\n\n${heartbeatMemoryText}`
               : "",
+            skillsText: opfsMemoryPolicyText,
           });
 
           requestMessages = built.messages;
@@ -245,9 +331,20 @@ export default function useChatSession() {
 
         const payload = {
           ...CONTEXT,
+          model: effectiveModel,
           stream: false,
           messages: requestMessages,
           tools: listFrontendToolDefinitions(),
+          metadata: {
+            llmProvider: {
+              id: String(selectedLlmProvider?.id || ""),
+              name: String(selectedLlmProvider?.name || ""),
+              provider: String(selectedLlmProvider?.provider || ""),
+              baseUrl: String(selectedLlmProvider?.baseUrl || ""),
+              tokenBudget: Math.max(0, Number(selectedLlmProvider?.tokenBudget) || 0),
+              hasTokenSecret: Boolean(selectedLlmProvider?.tokenSecret),
+            },
+          },
         };
 
         const streamAssistantId = `stream-assistant-${Date.now()}-${round}`;
@@ -444,13 +541,32 @@ export default function useChatSession() {
         ]);
       }
 
-      setMessages((prev) => [
-        ...prev.filter((m) => {
+      setMessages((prev) => {
+        const base = prev.filter((m) => {
           const ts = String(m?.timestamp || "");
           return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
-        }),
-        ...generatedAggregate,
-      ]);
+        });
+
+        const shared = globalThis?.WebagentRuntimeShared;
+        if (shared && typeof shared.appendMessageToSession === "function") {
+          let snapshot = {
+            messages: base,
+            telemetry: { usage: null, compaction: null },
+          };
+
+          for (const msg of generatedAggregate) {
+            const updated = shared.appendMessageToSession(snapshot, msg, {
+              contextWindowTokens: effectiveContextWindowTokens,
+              dedupe: true,
+            });
+            snapshot = updated?.snapshot || snapshot;
+          }
+
+          return normalizeMessages(snapshot.messages);
+        }
+
+        return [...base, ...generatedAggregate];
+      });
       setTelemetry({ usage, compaction });
 
       const tokenPart = typeof usage?.totalTokens === "number" ? ` · ${usage.totalTokens} tok` : "";
@@ -477,9 +593,9 @@ export default function useChatSession() {
     isHydrated,
     toolsReady,
     prompt,
-    isLoading,
     messages,
     route,
+    selectedLlmProvider,
     setPrompt,
     setIsLoading,
     setStatus,
@@ -695,6 +811,14 @@ export default function useChatSession() {
     setPrompt,
     status,
     setStatus,
+    llmProviders,
+    activeLlmProviderId,
+    activeLlmProvider,
+    setActiveLlmProviderId,
+    updateActiveLlmProvider,
+    addLlmProvider,
+    removeLlmProvider,
+    saveLlmSettings,
 
     isLoading,
     messages,

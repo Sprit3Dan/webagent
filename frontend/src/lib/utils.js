@@ -21,7 +21,9 @@ export function stringifyJsonSafe(
 
 export function normalizeRoute(pathname) {
   const route = typeof pathname === "string" ? pathname.trim() : "";
-  return route === ROUTES.STORAGE ? ROUTES.STORAGE : ROUTES.CHAT;
+  if (route === ROUTES.STORAGE) return ROUTES.STORAGE;
+  if (route === ROUTES.SETTINGS) return ROUTES.SETTINGS;
+  return ROUTES.CHAT;
 }
 
 export function isChatRoute(pathname) {
@@ -30,6 +32,10 @@ export function isChatRoute(pathname) {
 
 export function isStorageRoute(pathname) {
   return normalizeRoute(pathname) === ROUTES.STORAGE;
+}
+
+export function isSettingsRoute(pathname) {
+  return normalizeRoute(pathname) === ROUTES.SETTINGS;
 }
 
 export function currentRoute() {

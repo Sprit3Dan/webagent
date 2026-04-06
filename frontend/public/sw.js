@@ -1,12 +1,6 @@
 const SW_VERSION = "3.0.0";
 
-const DB_NAME = "webagent-skills-db";
-const DB_VERSION = 3;
 
-const DOCS_STORE = "docs";
-const CHUNKS_STORE = "chunks";
-const SKILLS_STORE = "skills";
-const TOOLS_STORE = "tools";
 
 const CACHE_NAME = "webagent-skill-cache-v3";
 const ACTION_EXECUTOR_JS = "js_code";
@@ -14,12 +8,27 @@ const ACTION_EXECUTOR_JS = "js_code";
 const DEFAULT_SKILL_ID = "registry::default";
 const DEFAULT_SKILL_NAME = "sw_unified_knowledge_runtime";
 
-const REQUIRED_STORES = [
-	DOCS_STORE,
-	CHUNKS_STORE,
-	SKILLS_STORE,
-	TOOLS_STORE,
-];
+
+
+importScripts("/shared/runtimeShared.js");
+
+const runtimeShared = self.WebagentRuntimeShared;
+if (!runtimeShared) {
+	throw new Error("Shared runtime module failed to load in service worker");
+}
+
+const runtimeDb = runtimeShared.RuntimeDbRegistry;
+if (!runtimeDb) {
+	throw new Error("Shared DB registry failed to load in service worker");
+}
+
+const DB_NAME = runtimeDb.DB_NAME;
+const DB_VERSION = runtimeDb.DB_VERSION;
+const DOCS_STORE = runtimeDb.DOCS_STORE;
+const CHUNKS_STORE = runtimeDb.CHUNKS_STORE;
+const SKILLS_STORE = runtimeDb.SKILLS_STORE;
+const TOOLS_STORE = runtimeDb.TOOLS_STORE;
+const REQUIRED_STORES = runtimeDb.REQUIRED_STORES;
 
 self.addEventListener("install", (event) => {
 	self.skipWaiting();
@@ -221,6 +230,11 @@ async function handlePushEvent(event) {
 
 	const heartbeatResult = await runHeartbeatPushFlow(payload);
 
+	await appendHeartbeatAssistantNoteToSnapshot({
+		payload,
+		heartbeatResult,
+	});
+
 	await notifyOpenClients({
 		type: "push.message",
 		payload,
@@ -282,6 +296,130 @@ async function notifyOpenClients(message) {
 	}
 }
 
+const runtimeHeartbeat = runtimeShared.RuntimeHeartbeat;
+
+async function appendHeartbeatAssistantNoteToSnapshot({ payload, heartbeatResult }) {
+	try {
+		const update = await runtimeHeartbeat.appendAssistantNoteToSnapshot({
+			payload,
+			assistantNote: heartbeatResult && heartbeatResult.assistantNote,
+			generatedAt: heartbeatResult && heartbeatResult.generatedAt,
+		});
+
+		let report = update && update.report ? update.report : null;
+
+		const toolMessages = Array.isArray(heartbeatResult && heartbeatResult.toolMessages)
+			? heartbeatResult.toolMessages
+			: [];
+
+		if (toolMessages.length) {
+			const storage = runtimeShared.RuntimeStorage;
+			const fileName = runtimeHeartbeat.getSnapshotFileNameFromPayload(payload);
+			let snapshot = await storage.readSnapshotFromOpfs(fileName);
+
+			for (const toolMessage of toolMessages) {
+				const sanitized = runtimeShared.sanitizeMessage({
+					role: "tool",
+					name: String((toolMessage && toolMessage.name) || "unknown"),
+					tool_call_id: String((toolMessage && toolMessage.tool_call_id) || ""),
+					content: String((toolMessage && toolMessage.content) || "null"),
+					timestamp: String((toolMessage && toolMessage.timestamp) || nowIso()),
+				});
+
+				const next = runtimeHeartbeat.buildSessionUpdate(
+					snapshot,
+					sanitized,
+					payload,
+				);
+
+				snapshot = (next && next.snapshot) || snapshot;
+				if (next && next.report) report = next.report;
+			}
+
+			await storage.writeSnapshotToOpfs(fileName, snapshot);
+		}
+
+		if (report && report.triggered) {
+			await triggerCompactionContextPersistence(payload, report);
+		}
+	} catch (err) {
+		void err;
+	}
+}
+
+async function triggerCompactionContextPersistence(payload, report) {
+	if (!report || report.triggered !== true) return;
+
+	try {
+		const decision = await reviewCompactionPersistenceWithLlm({ payload, report });
+		const toolCalls = Array.isArray(decision && decision.toolCalls) ? decision.toolCalls : [];
+		if (!toolCalls.length) return;
+
+		const db = await openDb();
+		for (const call of toolCalls) {
+			const fn = call && call.function ? call.function : {};
+			const toolName = String((fn && fn.name) || "").trim();
+			if (!toolName.startsWith("opfs_")) continue;
+
+			const args = runtimeShared.RuntimeUtils.parseJsonObjectSafe(fn && fn.arguments, {});
+			// eslint-disable-next-line no-await-in-loop
+			await executeRegisteredToolByName(db, toolName, args, { source: "heartbeat_compaction" });
+		}
+	} catch (err) {
+		void err;
+		try {
+			const db = await openDb();
+			const summary = String(report.summary || "").trim();
+			const threshold = runtimeShared.toInt(report.thresholdTokens, 0);
+			const before = runtimeShared.toInt(report.estimatedTokensBefore, 0);
+			const after = runtimeShared.toInt(report.estimatedTokensAfter, 0);
+			const dropped = runtimeShared.toInt(report.droppedMessages, 0);
+
+			const fallbackText =
+				`\n\n## Compaction Notes (${nowIso()})\n` +
+				`- Triggered during heartbeat persistence\n` +
+				`- Tokens: ${before} -> ${after} (threshold ${threshold})\n` +
+				`- Dropped messages: ${dropped}\n` +
+				(summary ? `\n${summary}\n` : "\n");
+
+			await executeRegisteredToolByName(
+				db,
+				"opfs_edit_file",
+				{ path: "USER.md", append: fallbackText },
+				{ source: "heartbeat_compaction_fallback" },
+			);
+		} catch (fallbackErr) {
+			void fallbackErr;
+		}
+	}
+}
+
+async function reviewCompactionPersistenceWithLlm({ payload, report }) {
+	try {
+		const requestBody = runtimeHeartbeat.buildCompactionPersistenceRequestPayload({
+			payload,
+			report,
+		});
+
+		const res = await fetch("/api/agent/respond", {
+			method: "POST",
+			headers: runtimeHeartbeat.buildAgentRequestHeaders(payload),
+			credentials: "same-origin",
+			body: JSON.stringify(requestBody),
+		});
+
+		if (!res.ok) return { toolCalls: [] };
+
+		const data = await res.json();
+		const message = (data && data.message) || {};
+		const toolCalls = Array.isArray(message && message.tool_calls) ? message.tool_calls : [];
+		return { toolCalls };
+	} catch (err) {
+		void err;
+		return { toolCalls: [] };
+	}
+}
+
 async function runHeartbeatPushFlow(payload) {
 	const type = String((payload && payload.type) || "").trim().toLowerCase();
 	if (type !== "heartbeat") return null;
@@ -305,44 +443,11 @@ async function runHeartbeatPushFlow(payload) {
 			completed: completedBefore,
 		});
 
-		const executedTools = [];
-		const toolCalls = Array.isArray(decision && decision.toolCalls)
-			? decision.toolCalls
+		const executedTools = Array.isArray(decision && decision.executedTools)
+			? decision.executedTools.filter(
+				(item) => item && String((item && item.name) || "").trim(),
+			)
 			: [];
-
-		for (const call of toolCalls) {
-			const fn = call && call.function ? call.function : {};
-			const toolName = String((fn && fn.name) || "").trim();
-			if (!toolName) continue;
-
-			const args = parseJsonObjectSafe(fn && fn.arguments);
-
-			const handled = await executeHeartbeatPendingTool(
-				toolName,
-				args,
-				{ source: "heartbeat_push" },
-			);
-
-			if (handled && handled.__handled) {
-				executedTools.push({
-					name: toolName,
-					result: handled.result,
-				});
-				continue;
-			}
-
-			const result = await executeRegisteredToolByName(
-				db,
-				toolName,
-				args,
-				{ source: "heartbeat_push" },
-			);
-
-			executedTools.push({
-				name: toolName,
-				result,
-			});
-		}
 
 		const markdownAfter = await loadHeartbeatMarkdown(db);
 		const parsedAfter = parseHeartbeatMarkdown(markdownAfter);
@@ -355,7 +460,7 @@ async function runHeartbeatPushFlow(payload) {
 
 		let assistantNote = String((decision && decision.assistantNote) || "").trim();
 		if (!assistantNote) {
-			assistantNote = buildHeartbeatAssistantNote({
+			assistantNote = runtimeHeartbeat.buildAssistantNote({
 				beforePending: pendingBefore,
 				afterPending: pendingAfter,
 			});
@@ -366,6 +471,26 @@ async function runHeartbeatPushFlow(payload) {
 			assistantNote += `\n\nHeartbeat actions executed: ${names}`;
 		}
 
+		const toolMessages = executedTools.map((tool) =>
+			runtimeShared.sanitizeMessage({
+				role: "tool",
+				name: String((tool && tool.name) || "unknown"),
+				tool_call_id: String((tool && tool.toolCallId) || ""),
+				content: String(
+					(tool && tool.content) ||
+						(() => {
+							try {
+								return JSON.stringify((tool && tool.result) ?? null);
+							} catch (err) {
+								void err;
+								return "null";
+							}
+						})(),
+				),
+				timestamp: nowIso(),
+			}),
+		);
+
 		return {
 			assistantNote,
 			localAssistantNote: assistantNote,
@@ -373,6 +498,7 @@ async function runHeartbeatPushFlow(payload) {
 			pendingCount: pendingAfter.length,
 			completedCount: completedAfter.length,
 			executedToolCount: executedTools.length,
+			toolMessages,
 			generatedAt: nowIso(),
 		};
 	} catch (err) {
@@ -388,229 +514,141 @@ async function runHeartbeatPushFlow(payload) {
 
 async function reviewHeartbeatActionWithLlm({ db, payload, markdown, pending, completed }) {
 	try {
-		const tenantId = String((payload && payload.tenantId) || "tenant-dev");
-		const userId = String((payload && payload.userId) || "user-001");
-		const agentId = String((payload && payload.agentId) || "agent-main");
-		const sessionId = String((payload && payload.sessionId) || "chat-001");
-		const model = String((payload && payload.model) || "nemotron-30b");
-
 		const registryTools = await getAllByStore(db, TOOLS_STORE);
-		const plannerTools = (registryTools || [])
-			.filter((tool) => tool && tool.enabled !== false)
-			.map((tool) => ({
-				type: "function",
-				function: {
-					name: String(tool.name || ""),
-					description: "Runtime tool from backend-registered registry",
-					parameters: {
-						type: "object",
-						properties: {},
-						additionalProperties: true,
-					},
-				},
-			}))
-			.filter((toolDef) => String((toolDef.function && toolDef.function.name) || "").trim());
+		const plannerTools = runtimeHeartbeat.buildPlannerToolsFromRegistryTools(registryTools);
 
 		if (!plannerTools.length) {
-			return { assistantNote: null, toolCalls: [] };
+			return { assistantNote: null, toolCalls: [], executedTools: [] };
 		}
 
-		const context = await buildHeartbeatContextForLlm({
-			tenantId,
-			userId,
-			agentId,
-			sessionId,
+		const context = await runtimeHeartbeat.buildHeartbeatContext({
 			payload,
 			markdown,
 			pending,
 			completed,
 		});
 
-		const requestBody = {
-			tenantId,
-			userId,
-			agentId,
-			sessionId,
-			model,
-			temperature: 0.2,
-			stream: false,
-			messages: context.messages,
-			tools: plannerTools,
-		};
+		let workingMessages = runtimeShared.normalizeMessages(context.messages || []);
+		let assistantNote = null;
+		let lastToolCalls = [];
+		const executedTools = [];
+		const maxRounds = Math.max(
+			1,
+			Math.min(6, runtimeShared.toInt(payload && payload.maxToolRounds, 4)),
+		);
 
-		const res = await fetch("/api/agent/respond", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"x-tenant-id": tenantId,
-				"x-user-id": userId,
-				"x-agent-id": agentId,
-			},
-			credentials: "same-origin",
-			body: JSON.stringify(requestBody),
-		});
+		for (let round = 0; round < maxRounds; round += 1) {
+			const requestBody = runtimeHeartbeat.buildHeartbeatDecisionRequestPayload({
+				payload,
+				contextMessages: workingMessages,
+				plannerTools,
+			});
 
-		if (!res.ok) return { assistantNote: null, toolCalls: [] };
+			const res = await fetch("/api/agent/respond", {
+				method: "POST",
+				headers: runtimeHeartbeat.buildAgentRequestHeaders(payload),
+				credentials: "same-origin",
+				body: JSON.stringify(requestBody),
+			});
 
-		const data = await res.json();
-		const message = (data && data.message) || {};
-		const assistantNote = String((message && message.content) || "").trim() || null;
-		const toolCalls = Array.isArray(message && message.tool_calls)
-			? message.tool_calls
-			: [];
+			if (!res.ok) break;
 
-		return { assistantNote, toolCalls };
-	} catch (err) {
-		void err;
-		return { assistantNote: null, toolCalls: [] };
-	}
-}
+			const data = await res.json();
+			const message = (data && data.message) || {};
+			const content = String((message && message.content) || "").trim();
+			if (content) assistantNote = content;
 
-async function buildHeartbeatContextForLlm({
-	tenantId,
-	userId,
-	agentId,
-	sessionId,
-	payload,
-	markdown,
-	pending,
-	completed,
-}) {
-	const roleHistory = normalizeHeartbeatHistory(payload && payload.history);
-	const bootstrapText = await readHeartbeatBootstrapTextFromOpfs();
+			const toolCalls = Array.isArray(message && message.tool_calls)
+				? message.tool_calls
+				: [];
+			lastToolCalls = toolCalls;
 
-	const identitySection =
-		"# webagent\n\n" +
-		"You are webagent, a frontend-first assistant with service-worker tools.\n\n" +
-		"## Runtime\n" +
-		"- Environment: service-worker\n\n" +
-		"## Scope\n" +
-		`- tenantId: ${tenantId}\n` +
-		`- userId: ${userId}\n` +
-		`- agentId: ${agentId}\n` +
-		`- sessionId: ${sessionId}`;
+			const assistantMessage = runtimeShared.sanitizeMessage({
+				role: "assistant",
+				content: String((message && message.content) || ""),
+				reasoning:
+					typeof (message && message.reasoning) === "string"
+						? message.reasoning
+						: undefined,
+				tool_calls: toolCalls.length ? toolCalls : undefined,
+				timestamp: nowIso(),
+			});
 
-	const memoryText =
-		"## Heartbeat Pending Markdown\n\n" +
-		String(markdown || "").slice(0, 12000);
+			workingMessages = runtimeShared.normalizeMessages([
+				...workingMessages,
+				assistantMessage,
+			]);
 
-	const skillsText =
-		"Heartbeat runtime loop.\n" +
-		"If action is needed, emit tool_calls with correct arguments.\n" +
-		"If no action is needed, return a concise summary.\n" +
-		"Never invent tool results; rely on tool outputs as source of truth.";
+			if (!toolCalls.length) break;
 
-	const systemPrompt = [
-		cleanHeartbeatText(identitySection),
-		cleanHeartbeatText(bootstrapText),
-		`# Memory\n\n${cleanHeartbeatText(memoryText)}`,
-		`# Skills\n\n${cleanHeartbeatText(skillsText)}`,
-	]
-		.filter(Boolean)
-		.join("\n\n---\n\n");
+			for (const call of toolCalls) {
+				const fn = call && call.function ? call.function : {};
+				const toolName = String((fn && fn.name) || "").trim();
+				if (!toolName) continue;
 
-	const runtimeBlock =
-		`Current Time: ${nowIso()}\n` +
-		"Route: /\n" +
-		"Page: chat\n" +
-		`tenantId: ${tenantId}\n` +
-		`userId: ${userId}\n` +
-		`agentId: ${agentId}\n` +
-		`sessionId: ${sessionId}`;
+				const args = runtimeShared.RuntimeUtils.parseJsonObjectSafe(
+					fn && fn.arguments,
+					{},
+				);
 
-	const taskBlock =
-		"Heartbeat run.\n" +
-		"Review pending items and decide actions from current state.\n" +
-		"If action is needed, use tool_calls.\n" +
-		"If no action is needed, return a concise summary.\n\n" +
-		`Pending count: ${Array.isArray(pending) ? pending.length : 0}\n` +
-		`Completed count: ${Array.isArray(completed) ? completed.length : 0}\n\n` +
-		"Heartbeat markdown:\n\n" +
-		String(markdown || "").slice(0, 12000);
+				let result;
+				const handled = await executeHeartbeatPendingTool(
+					toolName,
+					args,
+					{ source: "heartbeat_push", round },
+				);
 
-	const messages = [
-		{ role: "system", content: systemPrompt, timestamp: nowIso() },
-		...roleHistory.filter((m) => m.role !== "system"),
-		{
-			role: "user",
-			content: `${runtimeBlock}\n\n${taskBlock}`,
-			timestamp: nowIso(),
-		},
-	];
+				if (handled && handled.__handled) {
+					result = handled.result;
+				} else {
+					result = await executeRegisteredToolByName(
+						db,
+						toolName,
+						args,
+						{ source: "heartbeat_push", round },
+					);
+				}
 
-	return { systemPrompt, messages };
-}
+				const callId = String((call && call.id) || "").trim() || "";
+				let toolContent = "null";
+				try {
+					toolContent = JSON.stringify(result ?? null);
+				} catch (jsonErr) {
+					void jsonErr;
+				}
 
-function normalizeHeartbeatHistory(history) {
-	const list = Array.isArray(history) ? history : [];
-	return list
-		.map((m) => ({
-			role: String((m && m.role) || ""),
-			content: typeof (m && m.content) === "string" ? m.content : "",
-			name: typeof (m && m.name) === "string" ? m.name : undefined,
-			tool_call_id:
-				typeof (m && m.tool_call_id) === "string"
-					? m.tool_call_id
-					: undefined,
-			tool_calls: Array.isArray(m && m.tool_calls) ? m.tool_calls : undefined,
-			timestamp: (m && m.timestamp) || nowIso(),
-		}))
-		.filter((m) => ["system", "user", "assistant", "tool"].includes(m.role));
-}
+				executedTools.push({
+					toolCallId: callId,
+					name: toolName,
+					result,
+					content: toolContent,
+				});
 
-function cleanHeartbeatText(value) {
-	return String(value || "").replace(/\r\n/g, "\n").trim();
-}
+				const toolMessage = runtimeShared.sanitizeMessage({
+					role: "tool",
+					name: toolName,
+					tool_call_id: callId,
+					content: toolContent,
+					timestamp: nowIso(),
+				});
 
-function parseJsonObjectSafe(rawArgs) {
-	if (rawArgs == null) return {};
-	if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) return rawArgs;
-	if (typeof rawArgs !== "string") return {};
-
-	const text = rawArgs.trim();
-	if (!text) return {};
-
-	try {
-		const parsed = JSON.parse(text);
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			return parsed;
+				workingMessages = runtimeShared.normalizeMessages([
+					...workingMessages,
+					toolMessage,
+				]);
+			}
 		}
-		return {};
+
+		return {
+			assistantNote,
+			toolCalls: lastToolCalls,
+			executedTools,
+		};
 	} catch (err) {
 		void err;
-		return {};
+		return { assistantNote: null, toolCalls: [], executedTools: [] };
 	}
 }
-
-function buildHeartbeatAssistantNote({ beforePending, afterPending }) {
-	const before = Array.isArray(beforePending) ? beforePending : [];
-	const after = Array.isArray(afterPending) ? afterPending : [];
-
-	const wantsPong = [...after, ...before].some((item) => {
-		const text = sanitizeHeartbeatItemText(item && item.text).toLowerCase();
-		return /\bpong\b/.test(text) && /(reply|respond|say|heartbeat)/.test(text);
-	});
-
-	if (!before.length) {
-		const base = "Heartbeat tick: no pending items in the markdown list.";
-		return wantsPong ? `pong\n\n${base}` : base;
-	}
-
-	const nextPreview = after
-		.slice(0, 3)
-		.map((item, idx) => `${idx + 1}. ${sanitizeHeartbeatItemText(item && item.text)}`)
-		.filter(Boolean);
-
-	const base =
-		`Heartbeat tick: pending items before=${before.length}, after=${after.length}.` +
-		(nextPreview.length ? ` Next up:\n${nextPreview.join("\n")}` : "");
-
-	return wantsPong ? `pong\n\n${base}` : base;
-}
-
-
-
-
 
 async function executeSkillTool(skillName, toolName, args, context) {
 	const heartbeatHandled = await executeHeartbeatPendingTool(
@@ -668,36 +706,7 @@ const HEARTBEAT_MD_TEMPLATE =
 	"## Completed\n\n" +
 	"<!-- Completed checklist items -->\n";
 
-const HEARTBEAT_BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"];
 
-async function readHeartbeatBootstrapTextFromOpfs() {
-	try {
-		const nav = typeof self !== "undefined" ? self.navigator : null;
-		if (!nav || !nav.storage || typeof nav.storage.getDirectory !== "function") {
-			return "";
-		}
-
-		const root = await nav.storage.getDirectory();
-		const sections = [];
-
-		for (const fileName of HEARTBEAT_BOOTSTRAP_FILES) {
-			try {
-				const handle = await root.getFileHandle(fileName);
-				const file = await handle.getFile();
-				const text = cleanHeartbeatText(await file.text());
-				if (!text) continue;
-				sections.push(`## ${fileName}\n\n${text}`);
-			} catch (err) {
-				void err;
-			}
-		}
-
-		return sections.join("\n\n");
-	} catch (err) {
-		void err;
-		return "";
-	}
-}
 
 async function executeHeartbeatPendingTool(toolName, args, context) {
 	void context;
@@ -1144,10 +1153,10 @@ function buildKernelApi() {
 			tools: TOOLS_STORE,
 		},
 
-		nowIso,
-		randomId,
-		normalizeText,
-		tokenize,
+		nowIso: runtimeShared.nowIso,
+		randomId: runtimeShared.randomId,
+		normalizeText: runtimeShared.normalizeText,
+		tokenize: runtimeShared.tokenize,
 		freqMap,
 		chunkText,
 		stripHtmlToText,
@@ -1164,37 +1173,13 @@ function buildKernelApi() {
 	};
 }
 
-function nowIso() {
-	return new Date().toISOString();
-}
+const nowIso = runtimeShared.nowIso;
 
-function randomId(prefix = "id") {
-	if (self.crypto && typeof self.crypto.randomUUID === "function") {
-		return String(prefix) + "_" + self.crypto.randomUUID();
-	}
-	return (
-		String(prefix) +
-		"_" +
-		String(Date.now()) +
-		"_" +
-		Math.random().toString(36).slice(2, 10)
-	);
-}
+const randomId = runtimeShared.randomId;
 
-function normalizeText(value) {
-	return String(value || "")
-		.replace(/\r\n/g, "\n")
-		.trim();
-}
+const normalizeText = runtimeShared.normalizeText;
 
-function tokenize(text) {
-	return String(text || "")
-		.toLowerCase()
-		.replace(/[^\p{L}\p{N}\s]+/gu, " ")
-		.split(/\s+/)
-		.map((t) => t.trim())
-		.filter((t) => t.length > 1);
-}
+const tokenize = runtimeShared.tokenize;
 
 function freqMap(tokens) {
 	const out = Object.create(null);
@@ -1239,306 +1224,31 @@ function stripHtmlToText(html) {
 		.trim();
 }
 
-let _dbPromise = null;
-let _toolsInlineMigrated = false;
-
-function hasRequiredStores(db) {
-	const hasStores = REQUIRED_STORES.every((storeName) =>
-		db.objectStoreNames.contains(storeName),
-	);
-	if (!hasStores) return false;
-
-	try {
-		const tx = db.transaction(REQUIRED_STORES, "readonly");
-		const docs = tx.objectStore(DOCS_STORE);
-		const chunks = tx.objectStore(CHUNKS_STORE);
-		const skills = tx.objectStore(SKILLS_STORE);
-		const tools = tx.objectStore(TOOLS_STORE);
-
-		const hasDocsIndexes =
-			docs.indexNames.contains("scope") &&
-			docs.indexNames.contains("sourceUrl");
-		const hasChunksIndexes =
-			chunks.indexNames.contains("scope") &&
-			chunks.indexNames.contains("docId");
-		const hasSkillsIndexes =
-			skills.indexNames.contains("name") &&
-			skills.indexNames.contains("enabled");
-		const hasToolsIndexes =
-			tools.indexNames.contains("skillId") &&
-			tools.indexNames.contains("name") &&
-			tools.indexNames.contains("enabled");
-
-		return (
-			hasDocsIndexes &&
-			hasChunksIndexes &&
-			hasSkillsIndexes &&
-			hasToolsIndexes
-		);
-	} catch (err) {
-		void err;
-		return false;
-	}
-}
-
-function deleteDatabase(dbName) {
-	return new Promise((resolve, reject) => {
-		const req = indexedDB.deleteDatabase(dbName);
-		req.onsuccess = () => resolve();
-		req.onerror = () =>
-			reject(req.error || new Error("Failed to delete IndexedDB"));
-		req.onblocked = () =>
-			reject(
-				new Error(
-					"IndexedDB delete blocked by another open connection",
-				),
-			);
-	});
-}
-
-async function recreateDatabase() {
-	_dbPromise = null;
-	try {
-		await deleteDatabase(DB_NAME);
-	} catch (err) {
-		void err;
-	}
-	return openDb();
-}
+// runtimeDb is initialized at module bootstrap from shared runtime.
 
 function openDb() {
-	if (_dbPromise) return _dbPromise;
-
-	_dbPromise = new Promise((resolve, reject) => {
-		const req = indexedDB.open(DB_NAME, DB_VERSION);
-
-		req.onupgradeneeded = () => {
-			const db = req.result;
-
-			if (!db.objectStoreNames.contains(DOCS_STORE)) {
-				const docs = db.createObjectStore(DOCS_STORE, {
-					keyPath: "id",
-				});
-				docs.createIndex("scope", "scope", { unique: false });
-				docs.createIndex("sourceUrl", "sourceUrl", { unique: false });
-			}
-
-			if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
-				const chunks = db.createObjectStore(CHUNKS_STORE, {
-					keyPath: "id",
-				});
-				chunks.createIndex("scope", "scope", { unique: false });
-				chunks.createIndex("docId", "docId", { unique: false });
-			}
-
-			if (!db.objectStoreNames.contains(SKILLS_STORE)) {
-				const skills = db.createObjectStore(SKILLS_STORE, {
-					keyPath: "id",
-				});
-				skills.createIndex("name", "name", { unique: false });
-				skills.createIndex("enabled", "enabled", { unique: false });
-			}
-
-			if (!db.objectStoreNames.contains(TOOLS_STORE)) {
-				const toolStoreDef = db.createObjectStore(TOOLS_STORE, {
-					keyPath: "id",
-				});
-				toolStoreDef.createIndex("skillId", "skillId", {
-					unique: false,
-				});
-				toolStoreDef.createIndex("name", "name", { unique: false });
-				toolStoreDef.createIndex("enabled", "enabled", {
-					unique: false,
-				});
-			}
-		};
-
-		req.onsuccess = () => {
-			const db = req.result;
-
-			db.onversionchange = () => {
-				try {
-					db.close();
-				} catch (err) {
-					void err;
-				} finally {
-					_dbPromise = null;
-				}
-			};
-
-			db.onclose = () => {
-				_dbPromise = null;
-			};
-
-			if (!hasRequiredStores(db)) {
-				try {
-					db.close();
-				} catch (err) {
-					void err;
-				} finally {
-					_dbPromise = null;
-				}
-
-				recreateDatabase().then(resolve).catch(reject);
-				return;
-			}
-
-			migrateLegacyToolRuntimeRecords(db)
-				.then(() => resolve(db))
-				.catch(() => resolve(db));
-		};
-
-		req.onerror = () => {
-			_dbPromise = null;
-			reject(req.error || new Error("Failed to open IndexedDB"));
-		};
-	});
-
-	return _dbPromise;
+	return runtimeShared.openDb();
 }
 
-async function migrateLegacyToolRuntimeRecords(db) {
-	if (_toolsInlineMigrated) return;
-	_toolsInlineMigrated = true;
-
-	const tx = db.transaction([TOOLS_STORE, DOCS_STORE], "readwrite");
-	const toolsStore = tx.objectStore(TOOLS_STORE);
-	const docsStore = tx.objectStore(DOCS_STORE);
-
-	const allTools = await reqToPromise(toolsStore.getAll());
-	for (const toolRec of allTools || []) {
-		if (!toolRec) continue;
-
-		const next = { ...toolRec };
-		let changed = false;
-
-		if (Object.prototype.hasOwnProperty.call(next, "codeDocId")) {
-			delete next.codeDocId;
-			changed = true;
-		}
-
-		if (Object.prototype.hasOwnProperty.call(next, "moduleRefs")) {
-			delete next.moduleRefs;
-			changed = true;
-		}
-
-		if (changed) {
-			next.updatedAt = nowIso();
-			toolsStore.put(next);
-		}
-	}
-
-	const allDocs = await reqToPromise(docsStore.getAll());
-	for (const doc of allDocs || []) {
-		const docId = String((doc && doc.id) || "");
-		if (docId.includes("::doc::tool::")) {
-			docsStore.delete(docId);
-		}
-	}
-
-	await txDone(tx);
-}
-
-
-
-function txDone(tx) {
-	return new Promise((resolve, reject) => {
-		tx.oncomplete = () => resolve();
-		tx.onabort = () => reject(tx.error || new Error("Transaction aborted"));
-		tx.onerror = () => reject(tx.error || new Error("Transaction failed"));
-	});
-}
-
-function reqToPromise(req) {
-	return new Promise((resolve, reject) => {
-		req.onsuccess = () => resolve(req.result);
-		req.onerror = () =>
-			reject(req.error || new Error("IndexedDB request failed"));
-	});
-}
-
-function isClosingDbError(err) {
-	const message = String(err?.message || "");
-	return (
-		message.includes("database connection is closing") ||
-		message.includes("connection is closing") ||
-		message.includes("close pending") ||
-		message.includes("The database connection is closing")
-	);
-}
-
-function isMissingStoreError(err) {
-	const message = String(err?.message || "");
-	return (
-		message.includes("object stores was not found") ||
-		message.includes("object store was not found") ||
-		message.includes("One of the specified object stores was not found") ||
-		message.includes("The specified index was not found") ||
-		message.includes("Failed to execute 'index' on 'IDBObjectStore'")
-	);
-}
-
-async function withDbReadRetry(readOp) {
-	try {
-		return await readOp();
-	} catch (err) {
-		if (!isClosingDbError(err) && !isMissingStoreError(err)) throw err;
-
-		_dbPromise = null;
-
-		if (isMissingStoreError(err)) {
-			const recreated = await recreateDatabase();
-			return readOp(recreated);
-		}
-
-		const reopened = await openDb();
-		return readOp(reopened);
-	}
-}
+const txDone = runtimeShared.dbTxDone;
+const reqToPromise = runtimeShared.dbReqToPromise;
 
 async function getAllByStore(db, storeName) {
-	return withDbReadRetry(async (maybeDb) => {
-		const activeDb = maybeDb || db || (await openDb());
-		const tx = activeDb.transaction(storeName, "readonly");
-		const req = tx.objectStore(storeName).getAll();
-		const out = await reqToPromise(req);
-		await txDone(tx);
-		return out || [];
-	});
+	return runtimeShared.dbGetAllByStore(db, storeName);
 }
 
 async function getByKey(db, storeName, key) {
-	return withDbReadRetry(async (maybeDb) => {
-		const activeDb = maybeDb || db || (await openDb());
-		const tx = activeDb.transaction(storeName, "readonly");
-		const req = tx.objectStore(storeName).get(String(key));
-		const out = await reqToPromise(req);
-		await txDone(tx);
-		return out;
-	});
+	return runtimeShared.dbGetByKey(db, storeName, key);
 }
 
 async function getAllByIndex(db, storeName, indexName, value) {
-	return withDbReadRetry(async (maybeDb) => {
-		const activeDb = maybeDb || db || (await openDb());
-		const tx = activeDb.transaction(storeName, "readonly");
-		const store = tx.objectStore(storeName);
-		const idx = store.index(indexName);
-		const req = idx.getAll(IDBKeyRange.only(value));
-		const out = await reqToPromise(req);
-		await txDone(tx);
-		return out || [];
-	});
+	return runtimeShared.dbGetAllByIndex(db, storeName, indexName, value);
 }
 
 async function findDocBySource(db, scope, sourceUrl) {
-	if (!sourceUrl) return null;
-	const docs = await getAllByIndex(db, DOCS_STORE, "sourceUrl", sourceUrl);
-	return docs.find((d) => d.scope === scope) || null;
+	return runtimeShared.dbFindDocBySource(db, scope, sourceUrl);
 }
 
 async function deleteChunksByDoc(chunkStore, docId) {
-	const idx = chunkStore.index("docId");
-	const all = await reqToPromise(idx.getAll(IDBKeyRange.only(docId)));
-	for (const c of all || []) chunkStore.delete(c.id);
+	return runtimeShared.dbDeleteChunksByDoc(chunkStore, docId);
 }

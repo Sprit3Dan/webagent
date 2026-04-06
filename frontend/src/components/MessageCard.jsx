@@ -1,13 +1,13 @@
 import React from "react";
+import ReactMarkdown from "react-markdown";
+
+const runtimeShared = globalThis?.WebagentRuntimeShared;
+if (!runtimeShared) {
+  throw new Error("Shared runtime module is required");
+}
 
 function sanitizeMessage(m) {
-  return {
-    role: m?.role || "assistant",
-    content: typeof m?.content === "string" ? m.content : "",
-    tool_calls: Array.isArray(m?.tool_calls) ? m.tool_calls : undefined,
-    reasoning: typeof m?.reasoning === "string" ? m.reasoning : undefined,
-    timestamp: m?.timestamp || new Date().toISOString(),
-  };
+  return runtimeShared.sanitizeMessage(m, "assistant");
 }
 
 function roleStyle(role) {
@@ -68,8 +68,8 @@ export default function MessageCard({ msg }) {
         <span style={{ color: "#93a6b7" }}>{m.timestamp}</span>
       </div>
 
-      <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45, color: "#d6e2ee" }}>
-        {m.content}
+      <div style={{ lineHeight: 1.45, color: "#d6e2ee" }}>
+        <ReactMarkdown>{m.content}</ReactMarkdown>
       </div>
 
       {m.reasoning ? (
@@ -77,17 +77,16 @@ export default function MessageCard({ msg }) {
           <summary style={{ cursor: "pointer", color: "#93a6b7", fontSize: 12 }}>
             reasoning
           </summary>
-          <pre
+          <div
             style={{
               margin: "8px 0 0",
               color: "#c7d5e2",
-              whiteSpace: "pre-wrap",
               borderLeft: "1px solid #2a394a",
               paddingLeft: 8,
             }}
           >
-            {m.reasoning}
-          </pre>
+            <ReactMarkdown>{m.reasoning}</ReactMarkdown>
+          </div>
         </details>
       ) : null}
 

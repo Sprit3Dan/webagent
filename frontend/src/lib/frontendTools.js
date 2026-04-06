@@ -4,7 +4,10 @@ const SKILL_NAME = "sw_unified_knowledge_runtime";
 const SW_PATH = "/sw.js";
 const SW_TIMEOUT_MS = 20_000;
 
-
+const runtimeShared = globalThis?.WebagentRuntimeShared;
+if (!runtimeShared) {
+  throw new Error("Shared runtime module is required");
+}
 
 function safeJson(value, fallback = "{}") {
   try {
@@ -18,76 +21,14 @@ function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function repairLikelyTruncatedJsonObject(input) {
-  let text = String(input || "").trim();
-  if (!text.startsWith("{")) return text;
 
-  let inString = false;
-  let escaped = false;
-  let openCurly = 0;
-  let openSquare = 0;
-
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-
-    if (ch === "\\") {
-      escaped = true;
-      continue;
-    }
-
-    if (ch === "\"") {
-      inString = !inString;
-      continue;
-    }
-
-    if (inString) continue;
-
-    if (ch === "{") openCurly += 1;
-    else if (ch === "}") openCurly = Math.max(0, openCurly - 1);
-    else if (ch === "[") openSquare += 1;
-    else if (ch === "]") openSquare = Math.max(0, openSquare - 1);
-  }
-
-  if (inString) text += "\"";
-  if (openSquare > 0) text += "]".repeat(openSquare);
-  if (openCurly > 0) text += "}".repeat(openCurly);
-
-  // Remove trailing commas before closing braces/brackets.
-  return text.replace(/,\s*([}\]])/g, "$1");
-}
 
 function parseArgs(rawArgs) {
-  if (rawArgs == null) return {};
-  if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) return rawArgs;
-  if (typeof rawArgs !== "string") {
-    throw new Error("Tool arguments must be a JSON object or JSON string");
+  const parsed = runtimeShared.parseJsonObjectSafe(rawArgs, {});
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed;
   }
-
-  const text = rawArgs.trim();
-  if (!text) return {};
-
-  const repaired = repairLikelyTruncatedJsonObject(text);
-  const candidates = repaired !== text ? [text, repaired] : [text];
-
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (parsed == null) return {};
-      if (typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("Tool arguments JSON must decode to an object");
-      }
-      return parsed;
-    } catch {
-      // try next candidate
-    }
-  }
-
-  throw new Error("Invalid JSON in tool arguments");
+  throw new Error("Tool arguments must be a JSON object or JSON string");
 }
 
 const SUPPORTED_FRONTEND_TOOLS = new Set([
@@ -101,6 +42,9 @@ const SUPPORTED_FRONTEND_TOOLS = new Set([
   "heartbeat_add_pending_item",
   "heartbeat_list_pending_items",
   "heartbeat_complete_pending_item",
+  "opfs_read_file",
+  "opfs_write_file",
+  "opfs_edit_file",
 ]);
 
 const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
@@ -108,7 +52,7 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "memory_ingest_url",
-      description: "Ingest a URL into local retrieval memory in the service worker",
+      description: "Store URL content in IndexedDB long-term retrieval memory (not guaranteed to be injected into every prompt)",
       parameters: {
         type: "object",
         properties: {
@@ -126,7 +70,7 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "memory_ingest_text",
-      description: "Ingest raw text into local retrieval memory in the service worker",
+      description: "Store raw text in IndexedDB long-term retrieval memory (not guaranteed to be injected into every prompt)",
       parameters: {
         type: "object",
         properties: {
@@ -144,7 +88,7 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "memory_query",
-      description: "Query local retrieval memory and return relevant chunks",
+      description: "Query IndexedDB long-term retrieval memory and return relevant chunks on demand",
       parameters: {
         type: "object",
         properties: {
@@ -160,7 +104,7 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "memory_list_documents",
-      description: "List all indexed documents in local retrieval memory",
+      description: "List all IndexedDB long-term memory documents for the current scope",
       parameters: {
         type: "object",
         properties: {},
@@ -172,7 +116,7 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "memory_get_document",
-      description: "Get one indexed document and all of its chunks",
+      description: "Get one IndexedDB long-term memory document and all of its chunks",
       parameters: {
         type: "object",
         properties: {
@@ -187,7 +131,7 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "memory_delete_document",
-      description: "Delete one indexed document from local retrieval memory",
+      description: "Delete one document from IndexedDB long-term retrieval memory",
       parameters: {
         type: "object",
         properties: {
@@ -202,7 +146,7 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "memory_clear",
-      description: "Clear local retrieval memory for current tenant/user/session scope",
+      description: "Clear IndexedDB long-term retrieval memory for the current tenant/user/session scope",
       parameters: {
         type: "object",
         properties: {},
@@ -250,6 +194,56 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
           itemId: { type: "string" },
         },
         required: ["itemId"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "opfs_read_file",
+      description: "Read one allowed OPFS fast-path context file used directly in prompt construction",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", enum: ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "opfs_write_file",
+      description: "Write full content to one allowed OPFS context file (preferred for durable user/agent/process facts needed in future prompts)",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", enum: ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] },
+          content: { type: "string" },
+        },
+        required: ["path", "content"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "opfs_edit_file",
+      description: "Edit one allowed OPFS context file via append, prepend, or find/replace (OPFS-first for frequently needed guidance)",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", enum: ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] },
+          append: { type: "string" },
+          prepend: { type: "string" },
+          find: { type: "string" },
+          replace: { type: "string" },
+        },
+        required: ["path"],
         additionalProperties: false,
       },
     },
@@ -332,62 +326,27 @@ export function hasFrontendTool(name) {
   return typeof name === "string" && SUPPORTED_FRONTEND_TOOLS.has(name);
 }
 
-async function ensureServiceWorkerReady() {
-  if (!("serviceWorker" in navigator)) {
-    throw new Error("Service Worker is not supported in this browser");
-  }
 
-  let registration = await navigator.serviceWorker.getRegistration();
-  if (!registration) {
-    registration = await navigator.serviceWorker.register(SW_PATH);
-  }
-
-  await navigator.serviceWorker.ready;
-
-  let worker = navigator.serviceWorker.controller
-    || registration.active
-    || registration.waiting
-    || registration.installing;
-
-  if (!worker) {
-    throw new Error("Service worker is not active yet. Reload once and retry.");
-  }
-
-  return worker;
-}
 
 async function runSkillAction(toolName, args, context) {
-  const worker = await ensureServiceWorkerReady();
-  const id = `skill_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const id = runtimeShared.randomId("skill");
+  const payload = await runtimeShared.sendToServiceWorker(
+    {
+      type: "skill.run",
+      id,
+      skill: SKILL_NAME,
+      action: toolName,
+      args: args || {},
+      context: context || {},
+    },
+    { timeoutMs: SW_TIMEOUT_MS, swPath: SW_PATH },
+  );
 
-  return new Promise((resolve, reject) => {
-    const channel = new MessageChannel();
-    const timeout = setTimeout(() => {
-      reject(new Error("Service worker skill request timed out"));
-    }, SW_TIMEOUT_MS);
+  if (!payload?.ok) {
+    throw new Error(payload?.error || "Skill execution failed");
+  }
 
-    channel.port1.onmessage = (event) => {
-      clearTimeout(timeout);
-      const payload = event?.data || {};
-      if (!payload?.ok) {
-        reject(new Error(payload?.error || "Skill execution failed"));
-        return;
-      }
-      resolve(payload?.result ?? null);
-    };
-
-    worker.postMessage(
-      {
-        type: "skill.run",
-        id,
-        skill: SKILL_NAME,
-        action: toolName,
-        args: args || {},
-        context: context || {},
-      },
-      [channel.port2],
-    );
-  });
+  return payload?.result ?? null;
 }
 
 export async function executeFrontendToolCall(toolCall, context = {}) {

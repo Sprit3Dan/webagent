@@ -450,6 +450,7 @@ async def _run_agent_response(
             kwargs["temperature"] = payload.temperature
         if payload.max_tokens is not None:
             kwargs["max_tokens"] = payload.max_tokens
+
         if merged_tools:
             kwargs["tools"] = merged_tools
             kwargs["tool_choice"] = "auto"
@@ -604,6 +605,7 @@ async def agent_respond_sse(
         kwargs["temperature"] = payload.temperature
     if payload.max_tokens is not None:
         kwargs["max_tokens"] = payload.max_tokens
+
     if merged_tools:
         kwargs["tools"] = merged_tools
         kwargs["tool_choice"] = "auto"
