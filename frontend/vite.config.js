@@ -22,6 +22,7 @@ const serviceWorkerDevPlugin = () => ({
 });
 
 export default defineConfig({
+  envDir: "..",
   plugins: [react(), serviceWorkerDevPlugin()],
   server: {
     port: 5173,

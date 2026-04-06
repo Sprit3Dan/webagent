@@ -31,13 +31,9 @@ pnpm-debug.log*
 
 backend/.env
 backend/.env.*
-!backend/.env.example
-!backend/.env.sample
 
 frontend/.env
 frontend/.env.*
-!frontend/.env.example
-!frontend/.env.sample
 
 # ------------------------------
 # Python backend

@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=("../.env", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # LLM
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="nemotron-30b", alias="OPENAI_MODEL")
-    openai_base_url: Optional[str] = Field(default="http://inference.sprit3dan-labs.net/nemotron-30b/v1/", alias="OPENAI_BASE_URL")
+    openai_base_url: Optional[str] = Field(default=None, alias="OPENAI_BASE_URL")
 
     # Auth / multitenancy
     jwt_secret: str = Field(default="change-me", alias="JWT_SECRET")

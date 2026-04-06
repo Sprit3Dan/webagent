@@ -17,8 +17,8 @@ services:
       PORT: 8000
       RELOAD: "true"
       CORS_ORIGINS: '["http://localhost:5173"]'
-      OPENAI_MODEL: nemotron-30b
-      OPENAI_BASE_URL: http://inference.sprit3dan-labs.net/nemotron-30b/v1/
+      OPENAI_MODEL: ${OPENAI_MODEL:-nemotron-30b}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       REQUIRE_AUTH: "false"
       WEB_PUSH_ENABLED: ${WEB_PUSH_ENABLED:-false}
