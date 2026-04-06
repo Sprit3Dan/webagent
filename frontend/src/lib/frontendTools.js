@@ -39,6 +39,7 @@ const SUPPORTED_FRONTEND_TOOLS = new Set([
   "memory_get_document",
   "memory_delete_document",
   "memory_clear",
+  "web_search_duckduckgo",
   "heartbeat_add_pending_item",
   "heartbeat_list_pending_items",
   "heartbeat_complete_pending_item",
@@ -150,6 +151,22 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_search_duckduckgo",
+      description: "Search the public web via DuckDuckGo instant answer API and return normalized results",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          topK: { type: "number" },
+        },
+        required: ["query"],
         additionalProperties: false,
       },
     },

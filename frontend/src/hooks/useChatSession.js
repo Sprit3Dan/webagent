@@ -22,9 +22,11 @@ import {
   buildConversationMemoryPromptBlock,
   listAllSkillMemoryRecords,
   listStoreRecords,
+  readPersistedLlmProviderSettings,
   readSkillDocument,
   searchConversationMemoryKnn,
   writeConversationFactMemories,
+  writePersistedLlmProviderSettings,
 } from "../lib/skillMemory";
 import {
   buildTelemetryText,
@@ -73,13 +75,29 @@ function summarizeMemoryHits(hits) {
       count: 0,
       topScore: 0,
       avgScore: 0,
+      topBaseScore: 0,
+      avgBaseScore: 0,
+      topRecencyBonus: 0,
+      avgRecencyBonus: 0,
+      topSessionBonus: 0,
+      avgSessionBonus: 0,
       sessions: [],
       turnIndexes: [],
     };
   }
 
   const scores = list.map((item) => Number(item?.score || 0));
+  const baseScores = list.map((item) => Number(item?.baseScore || item?.score || 0));
+  const recencyBonuses = list.map((item) => Number(item?.recencyBonus || 0));
+  const sessionBonuses = list.map((item) => Number(item?.sessionBonus || 0));
+
   const avgScore = scores.reduce((acc, n) => acc + n, 0) / scores.length;
+  const avgBaseScore = baseScores.reduce((acc, n) => acc + n, 0) / baseScores.length;
+  const avgRecencyBonus =
+    recencyBonuses.reduce((acc, n) => acc + n, 0) / recencyBonuses.length;
+  const avgSessionBonus =
+    sessionBonuses.reduce((acc, n) => acc + n, 0) / sessionBonuses.length;
+
   const sessions = Array.from(
     new Set(list.map((item) => String(item?.sessionId || "")).filter(Boolean)),
   ).slice(0, 6);
@@ -92,6 +110,12 @@ function summarizeMemoryHits(hits) {
     count: list.length,
     topScore: Math.max(...scores),
     avgScore,
+    topBaseScore: Math.max(...baseScores),
+    avgBaseScore,
+    topRecencyBonus: Math.max(...recencyBonuses),
+    avgRecencyBonus,
+    topSessionBonus: Math.max(...sessionBonuses),
+    avgSessionBonus,
     sessions,
     turnIndexes,
   };
@@ -113,6 +137,12 @@ function logMemoryRetrieval({
     hitCount: summary.count,
     topScore: summary.topScore,
     avgScore: summary.avgScore,
+    topBaseScore: summary.topBaseScore,
+    avgBaseScore: summary.avgBaseScore,
+    topRecencyBonus: summary.topRecencyBonus,
+    avgRecencyBonus: summary.avgRecencyBonus,
+    topSessionBonus: summary.topSessionBonus,
+    avgSessionBonus: summary.avgSessionBonus,
     sessions: summary.sessions,
     turnIndexes: summary.turnIndexes,
   });
@@ -158,25 +188,70 @@ async function extractMajorUserFactsWithLlm({
     },
   };
 
+  const startedAt =
+    typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
+
   try {
-    const res = await fetch("/api/agent/respond", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-tenant-id": tenantId,
-        "x-user-id": userId,
-        "x-agent-id": agentId,
-      },
-      credentials: "same-origin",
-      mode: "same-origin",
-      body: JSON.stringify(payload),
+    console.info("[memory:facts] extractor:start", {
+      userChars: text.length,
+      maxFacts: FACT_EXTRACTION_MAX_FACTS,
+      model: payload.model,
+      hasBaseUrl: Boolean(payload?.metadata?.llmProvider?.baseUrl),
     });
 
-    if (!res.ok) return [];
+    const sseEvents = await postJsonAndConsumeSse(
+      "/api/agent/respond/sse",
+      { ...payload, stream: true },
+      {
+        headers: {
+          "content-type": "application/json",
+          "x-tenant-id": tenantId,
+          "x-user-id": userId,
+          "x-agent-id": agentId,
+        },
+      },
+    );
 
-    const data = await res.json();
-    const raw = String(data?.message?.content || "").trim();
-    if (!raw) return [];
+    let raw = "";
+
+    for (const evt of sseEvents) {
+      const payloadJson =
+        evt?.json && typeof evt.json === "object"
+          ? evt.json
+          : parseJsonSafe(evt?.data || "", null);
+
+      if (!payloadJson) continue;
+
+      if (evt.event === "delta" && payloadJson.type === "content") {
+        raw += String(payloadJson.text || "");
+        continue;
+      }
+
+      if (evt.event === "message") {
+        const full = String(payloadJson.content || "").trim();
+        if (full) raw = full;
+        continue;
+      }
+
+      if (evt.event === "done") {
+        const doneFull = String(payloadJson?.message?.content || "").trim();
+        if (doneFull) raw = doneFull;
+      }
+    }
+
+    raw = String(raw || "").trim();
+    if (!raw) {
+      console.info("[memory:facts] extractor:empty", {
+        durationMs: Math.round(
+          (typeof performance !== "undefined" && typeof performance.now === "function"
+            ? performance.now()
+            : Date.now()) - startedAt,
+        ),
+      });
+      return [];
+    }
 
     const normalized = raw
       .replace(/^```json\s*/i, "")
@@ -199,8 +274,29 @@ async function extractMajorUserFactsWithLlm({
       if (deduped.length >= FACT_EXTRACTION_MAX_FACTS) break;
     }
 
+    const endedAt =
+      typeof performance !== "undefined" && typeof performance.now === "function"
+        ? performance.now()
+        : Date.now();
+
+    console.info("[memory:facts] extractor:done", {
+      durationMs: Math.round(endedAt - startedAt),
+      parsedFacts: deduped.length,
+      rawPreview: raw.slice(0, 220),
+    });
+
     return deduped;
-  } catch {
+  } catch (err) {
+    const endedAt =
+      typeof performance !== "undefined" && typeof performance.now === "function"
+        ? performance.now()
+        : Date.now();
+
+    console.warn(
+      "[memory:facts] extractor:failed",
+      err instanceof Error ? err.message : "unknown error",
+      { durationMs: Math.round(endedAt - startedAt) },
+    );
     return [];
   }
 }
@@ -248,6 +344,7 @@ export default function useChatSession() {
   const listRef = useRef(null);
   const persistTimerRef = useRef(null);
   const swipeRef = useRef({ x: 0, y: 0 });
+  const spaceToggleIntentRef = useRef(false);
 
   const pagination = useMemo(
     () => derivePagination(messages, pageIndex, pageSize),
@@ -337,9 +434,19 @@ export default function useChatSession() {
     [activeLlmProviderId, llmProviders, setActiveLlmProviderId, setLlmProviders],
   );
 
-  const saveLlmSettings = useCallback(() => {
-    setStatus("settings: saved");
-  }, [setStatus]);
+  const saveLlmSettings = useCallback(async () => {
+    try {
+      await writePersistedLlmProviderSettings({
+        providers: llmProviders,
+        activeProviderId: activeLlmProviderId,
+      });
+      setStatus("settings: saved");
+    } catch (err) {
+      setStatus(
+        `settings: save failed · ${err instanceof Error ? err.message : "unknown error"}`,
+      );
+    }
+  }, [activeLlmProviderId, llmProviders, setStatus]);
 
   const focusComposer = useCallback(() => {
     const el = document.querySelector('textarea[aria-label="New message"]');
@@ -347,6 +454,7 @@ export default function useChatSession() {
   }, []);
 
   const toggleFocusedMessageDetails = useCallback(() => {
+    if (!spaceToggleIntentRef.current) return false;
     if (focusedMessageIndex < 0) return false;
     const root = listRef.current;
     if (!root) return false;
@@ -358,8 +466,9 @@ export default function useChatSession() {
     const details = card.querySelectorAll("details");
     if (!details.length) return false;
 
+    const shouldOpenAll = Array.from(details).some((node) => !node.open);
     details.forEach((node) => {
-      node.open = !node.open;
+      node.open = shouldOpenAll;
     });
     return true;
   }, [focusedMessageIndex]);
@@ -391,12 +500,48 @@ export default function useChatSession() {
   );
 
   useEffect(() => {
+    const onKeyDown = (event) => {
+      if (route !== ROUTES.CHAT) return;
+      if (event.defaultPrevented) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key !== " ") return;
+
+      const target = event.target;
+      const tag = target?.tagName?.toLowerCase?.() || "";
+      const editable = target?.isContentEditable || tag === "input" || tag === "textarea" || tag === "select";
+      if (editable) return;
+
+      event.preventDefault();
+      spaceToggleIntentRef.current = true;
+      try {
+        void toggleFocusedMessageDetails();
+      } finally {
+        spaceToggleIntentRef.current = false;
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [route, toggleFocusedMessageDetails]);
+
+  useEffect(() => {
     let active = true;
 
     (async () => {
       try {
         await loadFrontendToolDefinitionsFromOpfs({ persistFallback: true });
         await createAndRegisterSkill({ name: "sw_unified_knowledge_runtime" });
+
+        const persisted = await readPersistedLlmProviderSettings();
+        const persistedProviders = Array.isArray(persisted?.providers) ? persisted.providers : [];
+        if (active && persistedProviders.length) {
+          setLlmProviders(persistedProviders);
+          setActiveLlmProviderId(
+            String(persisted?.activeProviderId || persistedProviders[0]?.id || ""),
+          );
+        }
       } finally {
         if (active) setToolsReady(true);
       }
@@ -405,7 +550,7 @@ export default function useChatSession() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [setActiveLlmProviderId, setLlmProviders]);
 
   const send = useCallback(async (inputText = null) => {
     if (!storageReady || !isHydrated) {
@@ -429,8 +574,132 @@ export default function useChatSession() {
     if (typeof inputText !== "string") {
       setPrompt("");
     }
+
     setIsLoading(true);
     setStatus("agent: loading");
+
+    const turnIndex = Math.max(
+      0,
+      nextMessages.filter((m) => String(m?.role || "") === "user").length - 1,
+    );
+    let memoryQueued = false;
+    try {
+      memoryQueued = true;
+
+      void (async () => {
+        const startedAt =
+          typeof performance !== "undefined" && typeof performance.now === "function"
+            ? performance.now()
+            : Date.now();
+
+        try {
+          console.info("[memory:facts] background:start", {
+            turnIndex,
+            userChars: String(text || "").length,
+            model: String(selectedLlmProvider?.model || CONTEXT.model || ""),
+          });
+
+          const factTexts = await extractMajorUserFactsWithLlm({
+            userText: text,
+            selectedLlmProvider,
+            tenantId: CONTEXT.tenantId,
+            userId: CONTEXT.userId,
+            agentId: CONTEXT.agentId,
+            sessionId: CONTEXT.sessionId,
+          });
+
+          if (!factTexts.length) {
+            const endedAt =
+              typeof performance !== "undefined" && typeof performance.now === "function"
+                ? performance.now()
+                : Date.now();
+
+            console.info("[memory:facts] background:none", {
+              turnIndex,
+              durationMs: Math.round(endedAt - startedAt),
+            });
+            return;
+          }
+
+          console.info("[memory:facts] background:embedding", {
+            turnIndex,
+            factCount: factTexts.length,
+            model: MEMORY_EMBED_MODEL,
+            device: MEMORY_EMBED_DEVICE,
+            facts: factTexts,
+          });
+
+          const facts = await Promise.all(
+            factTexts.map(async (factText, factIndex) => {
+              const embedStartedAt =
+                typeof performance !== "undefined" && typeof performance.now === "function"
+                  ? performance.now()
+                  : Date.now();
+
+              const vec = await embedText(factText, {
+                model: MEMORY_EMBED_MODEL,
+                device: MEMORY_EMBED_DEVICE,
+              });
+
+              const embedEndedAt =
+                typeof performance !== "undefined" && typeof performance.now === "function"
+                  ? performance.now()
+                  : Date.now();
+
+              console.info("[memory:facts] background:embedded", {
+                turnIndex,
+                factIndex,
+                factPreview: factText.slice(0, 180),
+                dimensions: Array.isArray(vec?.embedding) ? vec.embedding.length : 0,
+                durationMs: Math.round(embedEndedAt - embedStartedAt),
+              });
+
+              return {
+                text: factText,
+                embedding: vec.embedding,
+              };
+            }),
+          );
+
+          await writeConversationFactMemories({
+            tenantId: CONTEXT.tenantId,
+            userId: CONTEXT.userId,
+            agentId: CONTEXT.agentId,
+            sessionId: CONTEXT.sessionId,
+            turnIndex,
+            embeddingModel: MEMORY_EMBED_MODEL,
+            facts,
+          });
+
+          const endedAt =
+            typeof performance !== "undefined" && typeof performance.now === "function"
+              ? performance.now()
+              : Date.now();
+
+          console.info("[memory:facts] background:stored", {
+            turnIndex,
+            count: facts.length,
+            durationMs: Math.round(endedAt - startedAt),
+          });
+        } catch (err) {
+          const endedAt =
+            typeof performance !== "undefined" && typeof performance.now === "function"
+              ? performance.now()
+              : Date.now();
+
+          console.warn(
+            "[memory:facts] background extraction failed",
+            err instanceof Error ? err.message : "unknown error",
+            { turnIndex, durationMs: Math.round(endedAt - startedAt) },
+          );
+        }
+      })();
+    } catch (err) {
+      console.warn(
+        "[memory:facts] queue failed",
+        err instanceof Error ? err.message : "unknown error",
+      );
+    }
 
     try {
       let workingMessages = nextMessages;
@@ -486,13 +755,34 @@ export default function useChatSession() {
               device: MEMORY_EMBED_DEVICE,
             });
 
+            const totalPriorUserTurns = historyWithoutCurrent
+              .filter((m) => String(m?.role || "") === "user")
+              .length;
+            const slidingWindowUserTurns = slidingWindowHistory
+              .filter((m) => String(m?.role || "") === "user")
+              .length;
+            const firstExcludedTurnIndex = Math.max(
+              0,
+              totalPriorUserTurns - slidingWindowUserTurns,
+            );
+            const excludeTurnIndexes = Array.from(
+              { length: slidingWindowUserTurns },
+              (_, idx) => firstExcludedTurnIndex + idx,
+            );
+
             const knn = await searchConversationMemoryKnn({
               tenantId: CONTEXT.tenantId,
               userId: CONTEXT.userId,
               agentId: CONTEXT.agentId,
+              sessionId: CONTEXT.sessionId,
+              excludeSessionId: CONTEXT.sessionId,
+              excludeTurnIndexes,
               queryEmbedding: queryEmbedding.embedding,
               topK: MEMORY_KNN_TOP_K,
               minScore: MEMORY_MIN_SCORE_FLOOR,
+              recencyWeight: 0.12,
+              recencyHalfLifeHours: 48,
+              sameSessionBoost: 0.08,
             });
 
             memoryRetrievalMs =
@@ -643,6 +933,8 @@ export default function useChatSession() {
             }
             return [...prev, liveMessage];
           });
+
+
         };
 
         const upsertLiveToolCallPreviews = (toolCalls) => {
@@ -671,6 +963,8 @@ export default function useChatSession() {
 
             return [...base, ...previews];
           });
+
+
         };
 
         const sseEvents = await postJsonAndConsumeSse(
@@ -853,72 +1147,7 @@ export default function useChatSession() {
       });
       setTelemetry({ usage, compaction });
 
-      let memoryQueued = false;
-      try {
-        const turnIndex = Math.max(
-          0,
-          nextMessages.filter((m) => String(m?.role || "") === "user").length - 1,
-        );
 
-        memoryQueued = true;
-
-        void (async () => {
-          try {
-            const factTexts = await extractMajorUserFactsWithLlm({
-              userText: text,
-              selectedLlmProvider,
-              tenantId: CONTEXT.tenantId,
-              userId: CONTEXT.userId,
-              agentId: CONTEXT.agentId,
-              sessionId: CONTEXT.sessionId,
-            });
-
-            if (!factTexts.length) {
-              console.info("[memory:facts] no major facts extracted");
-              return;
-            }
-
-            const facts = await Promise.all(
-              factTexts.map(async (factText) => {
-                const vec = await embedText(factText, {
-                  model: MEMORY_EMBED_MODEL,
-                  device: MEMORY_EMBED_DEVICE,
-                });
-
-                return {
-                  text: factText,
-                  embedding: vec.embedding,
-                };
-              }),
-            );
-
-            await writeConversationFactMemories({
-              tenantId: CONTEXT.tenantId,
-              userId: CONTEXT.userId,
-              agentId: CONTEXT.agentId,
-              sessionId: CONTEXT.sessionId,
-              turnIndex,
-              embeddingModel: MEMORY_EMBED_MODEL,
-              facts,
-            });
-
-            console.info("[memory:facts] stored", {
-              turnIndex,
-              count: facts.length,
-            });
-          } catch (err) {
-            console.warn(
-              "[memory:facts] background extraction failed",
-              err instanceof Error ? err.message : "unknown error",
-            );
-          }
-        })();
-      } catch (err) {
-        console.warn(
-          "[memory:facts] queue failed",
-          err instanceof Error ? err.message : "unknown error",
-        );
-      }
 
       const tokenPart = typeof usage?.totalTokens === "number" ? ` · ${usage.totalTokens} tok` : "";
       const compactPart = compaction?.triggered ? ` · compacted ${compaction?.droppedMessages ?? 0}` : "";
@@ -951,6 +1180,7 @@ export default function useChatSession() {
     setPrompt,
     setIsLoading,
     setStatus,
+
   ]);
 
   const refreshInspector = useCallback(async () => {

@@ -8,7 +8,17 @@ export function nowIso() {
 }
 
 export function sanitizeMessage(message, fallbackRole = "assistant") {
-  return runtimeShared.sanitizeMessage(message, fallbackRole);
+  const normalized = runtimeShared.sanitizeMessage(message, fallbackRole);
+
+  if (Array.isArray(message?.prompt_memories)) {
+    normalized.prompt_memories = message.prompt_memories;
+  }
+
+  if (message?.prompt_memory_meta && typeof message.prompt_memory_meta === "object") {
+    normalized.prompt_memory_meta = message.prompt_memory_meta;
+  }
+
+  return normalized;
 }
 
 export function makeUserMessage(content) {

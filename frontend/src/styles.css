@@ -37,6 +37,29 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+article a,
+article a:visited {
+  color: #8fffc0;
+  text-decoration: underline;
+  text-decoration-color: rgba(143, 255, 192, 0.65);
+  text-underline-offset: 2px;
+}
+
+article a:hover {
+  color: #c8ffdf;
+  text-decoration-color: rgba(200, 255, 223, 0.95);
+}
+
+article a:active {
+  color: #7be8ad;
+}
+
+article a:focus-visible {
+  outline: 1px solid rgba(46, 230, 127, 0.85);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
 .app {
   display: grid;
   grid-template-rows: auto 1fr auto;

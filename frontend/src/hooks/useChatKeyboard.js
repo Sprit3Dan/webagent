@@ -19,7 +19,6 @@ export default function useChatKeyboard({
   goNextPage,
   focusComposer,
   copyFocusedMessage,
-  toggleFocusedMessageDetails,
   setStatus,
   isEnabled = true,
 }) {
@@ -94,11 +93,7 @@ export default function useChatKeyboard({
         return;
       }
 
-      if (event.key === "Enter") {
-        event.preventDefault();
-        void toggleFocusedMessageDetails?.();
-        return;
-      }
+
 
       if (event.key === "ArrowLeft" || event.key === "h") {
         event.preventDefault();
@@ -158,7 +153,6 @@ export default function useChatKeyboard({
     goNextPage,
     focusComposer,
     copyFocusedMessage,
-    toggleFocusedMessageDetails,
     setStatus,
   ]);
 }

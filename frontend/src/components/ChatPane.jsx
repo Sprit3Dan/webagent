@@ -24,7 +24,6 @@ export default function ChatPane({
   const totalPages = Math.max(1, pages?.length || 0);
   const activePage = Math.min(pageIndex + 1, totalPages);
   const composerRef = useRef(null);
-  const messageRowRefs = useRef([]);
 
   useEffect(() => {
     const el = composerRef.current;
@@ -33,12 +32,7 @@ export default function ChatPane({
     el.style.height = `${Math.max(72, el.scrollHeight)}px`;
   }, [prompt]);
 
-  useEffect(() => {
-    if (focusedMessageIndex < 0) return;
-    const el = messageRowRefs.current[focusedMessageIndex];
-    if (!el) return;
-    el.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [focusedMessageIndex, pageIndex, currentPage.length]);
+
 
 
 
@@ -49,7 +43,8 @@ export default function ChatPane({
       onTouchEnd={onTouchEnd}
       style={{
         minHeight: 0,
-        overflow: "visible",
+        overflowY: "auto",
+        overflowX: "hidden",
         padding: 12,
         display: "flex",
         flexDirection: "column",
@@ -125,9 +120,6 @@ export default function ChatPane({
           return (
             <React.Fragment key={`${m.timestamp || "msg"}-${pageIndex}-${i}`}>
               <div
-                ref={(el) => {
-                  messageRowRefs.current[i] = el;
-                }}
                 style={{
                   outline: focused ? "1px solid #8aa7c4" : "1px solid transparent",
                   outlineOffset: 2,

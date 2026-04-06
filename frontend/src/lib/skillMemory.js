@@ -464,13 +464,17 @@ export async function writeConversationFactMemories({
   const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
   const safeTurnIndex = Math.max(0, Number(turnIndex) || 0);
   const now = new Date().toISOString();
-  const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
-  const store = tx.objectStore(SKILL_DOCS_STORE);
+  let stored = 0;
 
   for (let i = 0; i < normalizedFacts.length; i += 1) {
     const fact = normalizedFacts[i];
+    // Use per-record transaction to avoid transaction-lifecycle races under async load.
     // eslint-disable-next-line no-await-in-loop
     const existing = await readSkillDocument(fact.id);
+
+    const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+    const store = tx.objectStore(SKILL_DOCS_STORE);
+
     store.put({
       id: fact.id,
       scope,
@@ -486,15 +490,17 @@ export async function writeConversationFactMemories({
       createdAt: existing?.createdAt || now,
       updatedAt: now,
     });
-  }
 
-  await txDone(tx);
+    // eslint-disable-next-line no-await-in-loop
+    await txDone(tx);
+    stored += 1;
+  }
 
   return {
     scope,
     sessionId: String(sessionId),
     turnIndex: safeTurnIndex,
-    stored: normalizedFacts.length,
+    stored,
     skipped: false,
     updatedAt: now,
   };
@@ -533,9 +539,15 @@ export async function searchConversationMemoryKnn({
   tenantId = "tenant-dev",
   userId = "user-001",
   agentId = "agent-main",
+  sessionId = null,
+  excludeSessionId = null,
+  excludeTurnIndexes = [],
   queryEmbedding = [],
   topK = 12,
   minScore = 0.7,
+  recencyWeight = 0.08,
+  recencyHalfLifeHours = 72,
+  sameSessionBoost = 0.05,
 } = {}) {
   const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
   const query = normalizeVector(queryEmbedding);
@@ -562,41 +574,84 @@ export async function searchConversationMemoryKnn({
     return kind === CONVERSATION_MEMORY_DOC_KIND || kind === CONVERSATION_MEMORY_FACT_KIND;
   });
 
-  const scored = candidates.map((doc) => {
+  const nowMs = Date.now();
+  const safeRecencyWeight = Math.max(0, Math.min(1, Number(recencyWeight) || 0));
+  const safeHalfLifeHours = Math.max(1, Number(recencyHalfLifeHours) || 72);
+  const safeSessionBoost = Math.max(0, Math.min(1, Number(sameSessionBoost) || 0));
+  const preferredSessionId = String(sessionId || "").trim();
+  const excludedSessionId = String(excludeSessionId || "").trim();
+  const excludedTurnSet = new Set(
+    (Array.isArray(excludeTurnIndexes) ? excludeTurnIndexes : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value))
+      .map((value) => Math.max(0, Math.trunc(value))),
+  );
+
+  const filteredCandidates = candidates.filter((doc) => {
+    const docSessionId = String(doc?.sessionId || "");
+    const docTurnIndex = Math.max(0, Number(doc?.turnIndex || 0));
+
+    if (excludedSessionId && docSessionId === excludedSessionId) return false;
+    if (excludedTurnSet.has(docTurnIndex)) return false;
+    return true;
+  });
+
+  const scored = filteredCandidates.map((doc) => {
     const kind = String(doc?.kind || "");
+    const docSessionId = String(doc?.sessionId || "");
+    const updatedAt = String(doc?.updatedAt || doc?.createdAt || "");
+    const updatedAtMs = Date.parse(updatedAt);
+    const ageHours = Number.isFinite(updatedAtMs)
+      ? Math.max(0, (nowMs - updatedAtMs) / 3_600_000)
+      : safeHalfLifeHours * 4;
+    const recencyStrength = Math.exp((-Math.log(2) * ageHours) / safeHalfLifeHours);
+    const recencyBonus = safeRecencyWeight * recencyStrength;
+    const sessionBonus =
+      preferredSessionId && docSessionId === preferredSessionId ? safeSessionBoost : 0;
+
+    let baseScore = 0;
 
     if (kind === CONVERSATION_MEMORY_FACT_KIND) {
-      const factScore = cosineSimilarity(query, doc?.embedding || []);
+      baseScore = cosineSimilarity(query, doc?.embedding || []);
+      const score = Math.min(1, baseScore + recencyBonus + sessionBonus);
+
       return {
         id: String(doc?.id || ""),
-        score: factScore,
+        score,
+        baseScore,
+        recencyBonus,
+        sessionBonus,
         kind,
         turnIndex: Number(doc?.turnIndex || 0),
-        sessionId: String(doc?.sessionId || ""),
+        sessionId: docSessionId,
         text: String(doc?.text || ""),
         userText: "",
         assistantText: "",
         factText: String(doc?.text || ""),
-        updatedAt: String(doc?.updatedAt || doc?.createdAt || ""),
+        updatedAt,
         source: doc,
       };
     }
 
     const userScore = cosineSimilarity(query, doc?.userEmbedding || []);
     const assistantScore = cosineSimilarity(query, doc?.assistantEmbedding || []);
-    const score = Math.max(userScore, assistantScore);
+    baseScore = Math.max(userScore, assistantScore);
+    const score = Math.min(1, baseScore + recencyBonus + sessionBonus);
 
     return {
       id: String(doc?.id || ""),
       score,
+      baseScore,
+      recencyBonus,
+      sessionBonus,
       kind,
       turnIndex: Number(doc?.turnIndex || 0),
-      sessionId: String(doc?.sessionId || ""),
+      sessionId: docSessionId,
       text: String(doc?.text || ""),
       userText: String(doc?.userText || ""),
       assistantText: String(doc?.assistantText || ""),
       factText: "",
-      updatedAt: String(doc?.updatedAt || doc?.createdAt || ""),
+      updatedAt,
       source: doc,
     };
   });
@@ -613,7 +668,13 @@ export async function searchConversationMemoryKnn({
     scope,
     topK: safeTopK,
     minScore: threshold,
-    totalCandidates: candidates.length,
+    totalCandidates: filteredCandidates.length,
+    totalCandidatesBeforeExclusions: candidates.length,
+    excludeSessionId: excludedSessionId || null,
+    excludeTurnIndexes: Array.from(excludedTurnSet),
+    recencyWeight: safeRecencyWeight,
+    recencyHalfLifeHours: safeHalfLifeHours,
+    sameSessionBoost: safeSessionBoost,
     hits,
   };
 }

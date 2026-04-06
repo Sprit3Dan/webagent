@@ -60,6 +60,13 @@
           "code": "const tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst [docs, chunks] = await Promise.all([\n  kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope),\n  kernel.getAllByIndex(db, kernel.stores.chunks, \"scope\", scope)\n]);\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nfor (const d of docs) docsStore.delete(d.id);\nfor (const c of chunks) chunksStore.delete(c.id);\nawait kernel.txDone(tx);\nreturn { ok: true, scope, deletedDocuments: docs.length, deletedChunks: chunks.length };"
         },
         {
+          "id": "tool::web_search_duckduckgo",
+          "name": "web_search_duckduckgo",
+          "description": "Search the public web using backend /api/web/search and return normalized results.",
+          "enabled": true,
+          "code": "const query = kernel.normalizeText(args.query);\nif (!query) throw new Error(\"query is required\");\nconst topK = Math.max(1, Math.min(20, Number(args.topK || 5)));\nconst res = await fetch(\"/api/web/search\", {\n  method: \"POST\",\n  headers: {\n    \"content-type\": \"application/json\",\n    accept: \"application/json\"\n  },\n  credentials: \"same-origin\",\n  mode: \"same-origin\",\n  body: JSON.stringify({ query, topK })\n});\nif (!res.ok) {\n  let detail = \"\";\n  try { detail = String(await res.text() || \"\").trim(); } catch {}\n  throw new Error(`Web search request failed: ${res.status} ${res.statusText}${detail ? ` - ${detail}` : \"\"}`);\n}\nconst payload = await res.json();\nconst items = Array.isArray(payload && payload.results) ? payload.results : [];\nconst out = items.slice(0, topK).map((item) => ({\n  title: kernel.normalizeText((item && item.title) || \"\"),\n  url: String((item && item.url) || \"\").trim(),\n  snippet: kernel.normalizeText((item && item.snippet) || \"\"),\n  source: String((item && item.source) || \"duckduckgo\")\n})).filter((item) => item.url);\nreturn {\n  ok: true,\n  query,\n  count: out.length,\n  results: out,\n  source: String((payload && payload.source) || \"backend_web_search\"),\n  fetchedAt: String((payload && payload.fetchedAt) || kernel.nowIso())\n};"
+        },
+        {
           "id": "tool::heartbeat_add_pending_item",
           "name": "heartbeat_add_pending_item",
           "enabled": true,
