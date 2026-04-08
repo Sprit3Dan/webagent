@@ -506,6 +506,43 @@ export async function writeConversationFactMemories({
   };
 }
 
+export async function listConversationFactMemories({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  sessionId = null,
+  limit = 500,
+  offset = 0,
+  sortDesc = true,
+} = {}) {
+  const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
+  const docs = await listSkillDocuments({
+    scope,
+    limit: 10_000,
+    offset: 0,
+    sortDesc,
+  });
+
+  const targetSessionId = String(sessionId || "").trim();
+
+  const facts = docs.filter((doc) => {
+    if (String(doc?.kind || "") !== CONVERSATION_MEMORY_FACT_KIND) return false;
+    if (!targetSessionId) return true;
+    return String(doc?.sessionId || "") === targetSessionId;
+  });
+
+  facts.sort((a, b) => {
+    const ai = Number(a?.turnIndex || 0);
+    const bi = Number(b?.turnIndex || 0);
+    if (ai !== bi) return sortDesc ? bi - ai : ai - bi;
+    const afi = Number(a?.factIndex || 0);
+    const bfi = Number(b?.factIndex || 0);
+    return sortDesc ? bfi - afi : afi - bfi;
+  });
+
+  return pageArray(facts, { limit, offset });
+}
+
 export async function listConversationTurnMemories({
   tenantId = "tenant-dev",
   userId = "user-001",

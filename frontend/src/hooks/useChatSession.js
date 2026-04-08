@@ -21,6 +21,7 @@ import { createAndRegisterSkill } from "../lib/skills";
 import {
   buildConversationMemoryPromptBlock,
   listAllSkillMemoryRecords,
+  listConversationFactMemories,
   listStoreRecords,
   readPersistedLlmProviderSettings,
   readSkillDocument,
@@ -50,6 +51,7 @@ const MEMORY_EMBED_MODEL = WEBGPU_EMBEDDINGS_DEFAULTS.model;
 const MEMORY_EMBED_DEVICE = WEBGPU_EMBEDDINGS_DEFAULTS.device;
 const FACT_EXTRACTION_MAX_FACTS = 3;
 const FACT_EXTRACTION_MIN_USER_CHARS = 12;
+const FACT_DEDUP_KNN_THRESHOLD = 0.95;
 
 function pickSlidingWindowMessages(messages, rounds = SLIDING_WINDOW_ROUNDS) {
   const all = normalizeMessages(Array.isArray(messages) ? messages : []);
@@ -146,6 +148,27 @@ function logMemoryRetrieval({
     sessions: summary.sessions,
     turnIndexes: summary.turnIndexes,
   });
+}
+
+function cosineSimilarityVectors(a = [], b = []) {
+  const v1 = Array.isArray(a) ? a : [];
+  const v2 = Array.isArray(b) ? b : [];
+  if (!v1.length || !v2.length || v1.length !== v2.length) return 0;
+
+  let dot = 0;
+  let n1 = 0;
+  let n2 = 0;
+
+  for (let i = 0; i < v1.length; i += 1) {
+    const x = Number(v1[i]) || 0;
+    const y = Number(v2[i]) || 0;
+    dot += x * y;
+    n1 += x * x;
+    n2 += y * y;
+  }
+
+  if (!n1 || !n2) return 0;
+  return dot / (Math.sqrt(n1) * Math.sqrt(n2));
 }
 
 async function extractMajorUserFactsWithLlm({
@@ -661,6 +684,49 @@ export default function useChatSession() {
             }),
           );
 
+          const existingFacts = await listConversationFactMemories({
+            tenantId: CONTEXT.tenantId,
+            userId: CONTEXT.userId,
+            agentId: CONTEXT.agentId,
+            sessionId: CONTEXT.sessionId,
+            limit: 2000,
+            offset: 0,
+            sortDesc: true,
+          });
+
+          const dedupedFacts = [];
+          for (const fact of facts) {
+            const candidateVec = Array.isArray(fact?.embedding) ? fact.embedding : [];
+            if (!candidateVec.length) continue;
+
+            const duplicateInExisting = existingFacts.some((row) => {
+              const existingVec = Array.isArray(row?.embedding) ? row.embedding : [];
+              if (!existingVec.length || existingVec.length !== candidateVec.length) return false;
+              return cosineSimilarityVectors(candidateVec, existingVec) >= FACT_DEDUP_KNN_THRESHOLD;
+            });
+
+            if (duplicateInExisting) continue;
+
+            const duplicateInBatch = dedupedFacts.some((row) => {
+              const priorVec = Array.isArray(row?.embedding) ? row.embedding : [];
+              if (!priorVec.length || priorVec.length !== candidateVec.length) return false;
+              return cosineSimilarityVectors(candidateVec, priorVec) >= FACT_DEDUP_KNN_THRESHOLD;
+            });
+
+            if (duplicateInBatch) continue;
+            dedupedFacts.push(fact);
+          }
+
+          if (!dedupedFacts.length) {
+            console.info("[memory:facts] background:deduped-all", {
+              turnIndex,
+              threshold: FACT_DEDUP_KNN_THRESHOLD,
+              extracted: facts.length,
+              existing: existingFacts.length,
+            });
+            return;
+          }
+
           await writeConversationFactMemories({
             tenantId: CONTEXT.tenantId,
             userId: CONTEXT.userId,
@@ -668,7 +734,7 @@ export default function useChatSession() {
             sessionId: CONTEXT.sessionId,
             turnIndex,
             embeddingModel: MEMORY_EMBED_MODEL,
-            facts,
+            facts: dedupedFacts,
           });
 
           const endedAt =
@@ -678,7 +744,9 @@ export default function useChatSession() {
 
           console.info("[memory:facts] background:stored", {
             turnIndex,
-            count: facts.length,
+            count: dedupedFacts.length,
+            extractedCount: facts.length,
+            threshold: FACT_DEDUP_KNN_THRESHOLD,
             durationMs: Math.round(endedAt - startedAt),
           });
         } catch (err) {
