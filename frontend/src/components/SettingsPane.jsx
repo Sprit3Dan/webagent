@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 
 const PROVIDERS = [
   { value: "openai-compatible", label: "OpenAI-compatible" },
@@ -84,6 +84,62 @@ function rowStyle() {
   };
 }
 
+function A2AStatusCard() {
+  const [info, setInfo] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch("/api/a2a/health")
+      .then((r) => {
+        if (!r.ok) return { ok: false, a2aEnabled: false };
+        return r.json();
+      })
+      .then((d) => setInfo(d))
+      .catch(() => setInfo({ ok: false, a2aEnabled: false }))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const row = (label, value) => (
+    <div key={label} style={rowStyle()}>
+      <span style={{ color: "#6f8499", fontSize: 12 }}>{label}</span>
+      <span style={{ color: "#d0dce8", fontSize: 12, fontFamily: "monospace" }}>{value}</span>
+    </div>
+  );
+
+  return (
+    <div style={cardStyle()}>
+      <h3 style={{ margin: 0, color: "#cfe0ef", fontSize: 15 }}>A2A Status</h3>
+      <div style={{ color: "#93a6b7", fontSize: 12 }}>
+        Agent-to-agent delegation runtime. Configure via environment variables.
+      </div>
+      {loading ? (
+        <div style={{ color: "#6f8499", fontSize: 12 }}>Probing…</div>
+      ) : !info?.a2aEnabled ? (
+        <div style={{ color: "#e07070", fontSize: 12 }}>
+          Disabled — set <code style={{ color: "#ffd166" }}>A2A_ENABLED=true</code> on the backend.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {row("enabled", "true")}
+          {row("agent id", info.agentId || "—")}
+          {row("transport", info.transport?.backend || "—")}
+          {row("nats url", info.transport?.natsUrl || "—")}
+          {row("discovery url", info.discovery?.baseUrl || "—")}
+          {row("delegations", String(info.store?.delegations ?? "—"))}
+          {row(
+            "transport connected",
+            info.transport?.connected ? "yes" : "no",
+          )}
+          {row(
+            "discovery connected",
+            info.discovery?.connected ? "yes" : "no",
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPane({
   llmProviders = [],
   activeLlmProviderId = "",
@@ -113,7 +169,9 @@ export default function SettingsPane({
         alignItems: "start",
       }}
     >
-      <aside style={cardStyle()}>
+
+      <aside style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={cardStyle()}>
         <h3 style={{ margin: 0, color: "#cfe0ef", fontSize: 15 }}>Providers</h3>
         <div style={{ color: "#93a6b7", fontSize: 12 }}>
           Manage saved providers, then edit details in the right card.
@@ -182,6 +240,8 @@ export default function SettingsPane({
             remove
           </button>
         </div>
+        </div>
+        <A2AStatusCard />
       </aside>
 
       <main style={cardStyle()}>

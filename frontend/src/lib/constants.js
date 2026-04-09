@@ -25,4 +25,5 @@ export const ROUTES = {
   CHAT: "/",
   STORAGE: "/storage",
   SETTINGS: "/settings",
+  A2A: "/a2a",
 };

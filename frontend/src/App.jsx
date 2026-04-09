@@ -1,7 +1,8 @@
-import React from "react";
+import React, { useEffect } from "react";
 import ChatPane from "./components/ChatPane";
 import StoragePane from "./components/StoragePane";
 import SettingsPane from "./components/SettingsPane";
+import A2APane from "./components/A2APane";
 import TopBar from "./components/TopBar";
 import { AppProvider } from "./context/AppContext";
 import useChatKeyboard from "./hooks/useChatKeyboard";
@@ -51,7 +52,16 @@ function AppShell() {
     addLlmProvider,
     removeLlmProvider,
     saveLlmSettings,
+    delegations,
+    a2aEnabled,
+    refreshDelegations,
+    delegateTask,
   } = useChatSession();
+
+  // Probe A2A health when navigating to the A2A pane
+  useEffect(() => {
+    if (route === ROUTES.A2A) refreshDelegations();
+  }, [route]);
 
   useChatKeyboard({
     route,
@@ -130,6 +140,13 @@ function AppShell() {
           onAddProvider={addLlmProvider}
           onRemoveProvider={removeLlmProvider}
           onSave={saveLlmSettings}
+        />
+      ) : route === ROUTES.A2A ? (
+        <A2APane
+          delegations={delegations}
+          a2aEnabled={a2aEnabled}
+          onRefresh={refreshDelegations}
+          onDelegate={delegateTask}
         />
       ) : (
         <StoragePane

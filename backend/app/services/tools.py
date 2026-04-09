@@ -154,6 +154,71 @@ def to_tool_message(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _delegate_task_handler(
+    args: dict[str, Any],
+    context: dict[str, Any],
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    from ..core.config import get_settings
+    from .orchestrator import run_outbound_delegation
+    from uuid import uuid4
+
+    settings = get_settings()
+    if not settings.a2a_enabled:
+        return {"error": "A2A is disabled on this backend (set A2A_ENABLED=true)"}
+
+    task_text = str(args.get("task") or "")
+    if not task_text:
+        return {"error": "task argument is required"}
+
+    target_agent = str(args.get("target_agent") or "")
+    intent = str(args.get("intent") or "") or None
+    delegation_id = str(uuid4())
+
+    try:
+        receipt = await run_outbound_delegation(
+            delegation_id=delegation_id,
+            from_agent=str(settings.a2a_agent_id),
+            target_agent=target_agent,
+            task={"text": task_text},
+            intent=intent,
+            settings=settings,
+        )
+        return receipt
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+async def _get_delegation_status_handler(
+    args: dict[str, Any],
+    context: dict[str, Any],
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    from ..core.config import get_settings
+    from .delegation_store import get_delegation_store
+
+    settings = get_settings()
+    if not settings.a2a_enabled:
+        return {"error": "A2A is disabled"}
+
+    delegation_id = str(args.get("delegation_id") or "")
+    if not delegation_id:
+        return {"error": "delegation_id is required"}
+
+    record = get_delegation_store().get(delegation_id)
+    if record is None:
+        return {"error": f"delegation {delegation_id!r} not found"}
+
+    return {
+        "delegationId": record.delegation_id,
+        "status": record.status,
+        "targetAgent": record.target_agent,
+        "updatedAt": record.updated_at.isoformat(),
+        "result": record.result,
+        "error": record.error,
+    }
+
+
 def register_builtin_tools(*, include_if_exists: bool = True) -> list[dict[str, Any]]:
     def _safe_register(definition: dict[str, Any], handler: ToolHandler) -> None:
         name = ((definition or {}).get("function") or {}).get("name")
@@ -247,6 +312,62 @@ def register_builtin_tools(*, include_if_exists: bool = True) -> list[dict[str, 
             },
         },
         tenant_echo,
+    )
+
+    _safe_register(
+        {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "description": (
+                    "Delegate a task to a peer agent via A2A. "
+                    "Returns a delegationId you can poll with get_delegation_status. "
+                    "Only available when A2A_ENABLED=true."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "Plain-text task description to delegate",
+                        },
+                        "target_agent": {
+                            "type": "string",
+                            "description": "Target agent ID (omit to use discovery routing)",
+                        },
+                        "intent": {
+                            "type": "string",
+                            "description": "Semantic routing hint for discovery",
+                        },
+                    },
+                    "required": ["task"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        _delegate_task_handler,
+    )
+
+    _safe_register(
+        {
+            "type": "function",
+            "function": {
+                "name": "get_delegation_status",
+                "description": "Get the current status of a delegated task by delegationId.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "delegation_id": {
+                            "type": "string",
+                            "description": "The delegationId returned by delegate_task",
+                        },
+                    },
+                    "required": ["delegation_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        _get_delegation_status_handler,
     )
 
     return list_tool_definitions()

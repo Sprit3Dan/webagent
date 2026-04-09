@@ -46,6 +46,8 @@ const SUPPORTED_FRONTEND_TOOLS = new Set([
   "opfs_read_file",
   "opfs_write_file",
   "opfs_edit_file",
+  "delegate_task",
+  "get_delegation_status",
 ]);
 
 const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
@@ -265,6 +267,38 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "delegate_task",
+      description: "Delegate a task to a peer agent via A2A. Returns a delegationId to track progress with get_delegation_status.",
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "Description of the task to delegate" },
+          targetAgent: { type: "string", description: "Explicit peer agent ID; omit for discovery-based routing" },
+          intent: { type: "string", description: "Semantic hint for agent discovery (e.g. 'summarize', 'translate')" },
+        },
+        required: ["task"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_delegation_status",
+      description: "Check the status of a previously delegated task by delegationId. Returns status, result, error, and event ledger.",
+      parameters: {
+        type: "object",
+        properties: {
+          delegationId: { type: "string" },
+        },
+        required: ["delegationId"],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 let frontendToolDefinitionsCache = deepClone(DEFAULT_FRONTEND_TOOL_DEFINITIONS);
@@ -345,6 +379,35 @@ export function hasFrontendTool(name) {
 
 
 
+// Direct backend handlers bypass the service worker and call the REST API.
+const _DIRECT_BACKEND_HANDLERS = {
+  async delegate_task({ task, targetAgent, intent }) {
+    const body = { task };
+    if (targetAgent) body.targetAgent = targetAgent;
+    if (intent) body.intent = intent;
+    const res = await fetch("/api/agent/delegate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err?.detail || `delegate_task failed: ${res.status}`);
+    }
+    return res.json();
+  },
+
+  async get_delegation_status({ delegationId }) {
+    const res = await fetch(`/api/a2a/delegations/${encodeURIComponent(delegationId)}`);
+    if (res.status === 404) throw new Error(`Delegation ${delegationId} not found`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err?.detail || `get_delegation_status failed: ${res.status}`);
+    }
+    return res.json();
+  },
+};
+
 async function runSkillAction(toolName, args, context) {
   const id = runtimeShared.randomId("skill");
   const payload = await runtimeShared.sendToServiceWorker(
@@ -386,7 +449,10 @@ export async function executeFrontendToolCall(toolCall, context = {}) {
 
   try {
     const args = parseArgs(fn?.arguments);
-    const result = await runSkillAction(name, args, context);
+    const directHandler = _DIRECT_BACKEND_HANDLERS[name];
+    const result = directHandler
+      ? await directHandler(args)
+      : await runSkillAction(name, args, context);
 
     return {
       toolCallId: callId,

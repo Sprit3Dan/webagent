@@ -364,6 +364,10 @@ export default function useChatSession() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [toolsReady, setToolsReady] = useState(false);
 
+  // A2A delegation state
+  const [delegations, setDelegations] = useState([]);
+  const [a2aEnabled, setA2aEnabled] = useState(false);
+
   const listRef = useRef(null);
   const persistTimerRef = useRef(null);
   const swipeRef = useRef({ x: 0, y: 0 });
@@ -1454,6 +1458,40 @@ export default function useChatSession() {
     };
   }, [setStatus]);
 
+  // A2A: probe health and load delegations
+  const refreshDelegations = useCallback(async () => {
+    try {
+      const healthRes = await fetch(normalizeRoute("/api/a2a/health"));
+      if (!healthRes.ok) { setA2aEnabled(false); return; }
+      const health = await healthRes.json();
+      setA2aEnabled(Boolean(health?.a2aEnabled));
+      if (!health?.a2aEnabled) return;
+
+      const listRes = await fetch(normalizeRoute("/api/a2a/delegations?limit=100"));
+      if (!listRes.ok) return;
+      const data = await listRes.json();
+      const list = Array.isArray(data?.delegations) ? data.delegations : [];
+      setDelegations(list);
+    } catch (_) {
+      setA2aEnabled(false);
+    }
+  }, []);
+
+  const delegateTask = useCallback(async ({ task, targetAgent, intent } = {}) => {
+    try {
+      const res = await fetch(normalizeRoute("/api/agent/delegate"), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ task, targetAgent: targetAgent || undefined, intent: intent || undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) return { error: data?.detail || "delegation failed" };
+      return data;
+    } catch (err) {
+      return { error: String(err) };
+    }
+  }, []);
+
   return {
     route,
     navigate,
@@ -1505,5 +1543,11 @@ export default function useChatSession() {
     refreshInspector,
     viewFile,
     clearCurrentSession,
+
+    // A2A
+    delegations,
+    a2aEnabled,
+    refreshDelegations,
+    delegateTask,
   };
 }

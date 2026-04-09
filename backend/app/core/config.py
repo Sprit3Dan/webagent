@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,12 +39,42 @@ class Settings(BaseSettings):
     web_push_vapid_private_key: Optional[str] = Field(default=None, alias="WEB_PUSH_VAPID_PRIVATE_KEY")
     web_push_vapid_subject: Optional[str] = Field(default="mailto:admin@example.com", alias="WEB_PUSH_VAPID_SUBJECT")
 
+    # A2A (Agent-to-Agent delegation)
+    a2a_enabled: bool = Field(default=False, alias="A2A_ENABLED")
+    a2a_agent_id: Optional[str] = Field(default=None, alias="A2A_AGENT_ID")
+    a2a_transport_backend: str = Field(default="nats", alias="A2A_TRANSPORT_BACKEND")
+    a2a_discovery_base_url: Optional[str] = Field(default=None, alias="A2A_DISCOVERY_BASE_URL")
+    a2a_require_auth: bool = Field(default=False, alias="A2A_REQUIRE_AUTH")
+    a2a_shared_secret: Optional[str] = Field(default=None, alias="A2A_SHARED_SECRET")
+    a2a_clock_skew_seconds: int = Field(default=30, alias="A2A_CLOCK_SKEW_SECONDS")
+    a2a_nonce_ttl_seconds: int = Field(default=300, alias="A2A_NONCE_TTL_SECONDS")
+    # NATS JetStream transport
+    a2a_nats_url: Optional[str] = Field(default="nats://localhost:4222", alias="A2A_NATS_URL")
+    a2a_stream_name: str = Field(default="a2a", alias="A2A_STREAM_NAME")
+    a2a_subject_prefix: str = Field(default="a2a", alias="A2A_SUBJECT_PREFIX")
+    a2a_consumer_name: str = Field(default="webagent", alias="A2A_CONSUMER_NAME")
+    a2a_max_deliver: int = Field(default=5, alias="A2A_MAX_DELIVER")
+    a2a_ack_wait_seconds: int = Field(default=30, alias="A2A_ACK_WAIT_SECONDS")
+    a2a_execution_timeout_seconds: int = Field(default=120, alias="A2A_EXECUTION_TIMEOUT_SECONDS")
+
     # Agent behavior
 
     max_tool_rounds: int = Field(default=1, alias="MAX_TOOL_ROUNDS")
     request_timeout_seconds: int = Field(default=60, alias="REQUEST_TIMEOUT_SECONDS")
     compaction_trigger_total_tokens: int = Field(default=64_000, alias="COMPACTION_TRIGGER_TOTAL_TOKENS")
     compaction_target_total_tokens: int = Field(default=24_000, alias="COMPACTION_TARGET_TOTAL_TOKENS")
+
+    @model_validator(mode="after")
+    def validate_a2a_settings(self) -> "Settings":
+        if self.a2a_enabled:
+            if not self.a2a_agent_id:
+                raise ValueError("A2A_AGENT_ID is required when A2A_ENABLED=true")
+            if not self.a2a_discovery_base_url:
+                raise ValueError("A2A_DISCOVERY_BASE_URL is required when A2A_ENABLED=true")
+        if self.a2a_require_auth:
+            if not self.a2a_shared_secret:
+                raise ValueError("A2A_SHARED_SECRET is required when A2A_REQUIRE_AUTH=true")
+        return self
 
     @field_validator("cors_origins", mode="before")
     @classmethod

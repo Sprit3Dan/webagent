@@ -28,6 +28,7 @@ export default function TopBar({
   const isChatRoute = route === ROUTES.CHAT;
   const isStorageRoute = route === ROUTES.STORAGE;
   const isSettingsRoute = route === ROUTES.SETTINGS;
+  const isA2aRoute = route === ROUTES.A2A;
 
   return (
     <header
@@ -75,6 +76,13 @@ export default function TopBar({
           >
             settings · g ,
           </button>
+          <button
+            onClick={() => onNavigate(ROUTES.A2A)}
+            style={navButtonStyle(isA2aRoute)}
+            title="A2A delegation monitor"
+          >
+            a2a
+          </button>
 
           <label style={{ color: "#93a6b7", fontSize: 12 }}>
             provider
@@ -114,6 +122,8 @@ export default function TopBar({
           </div>
         ) : isSettingsRoute ? (
           <span style={{ color: "#93a6b7", fontSize: 12 }}>settings: provider configuration</span>
+        ) : isA2aRoute ? (
+          <span style={{ color: "#93a6b7", fontSize: 12 }}>a2a: agent delegation monitor</span>
         ) : (
           <span style={{ color: "#93a6b7", fontSize: 12 }}>{inspectorStatus}</span>
         )}
@@ -124,7 +134,9 @@ export default function TopBar({
           ? telemetryText
           : isSettingsRoute
             ? "LLM settings · manage providers, model, context size, and budget"
-            : "OPFS inspector · browse files and clear active session snapshot"}
+            : isA2aRoute
+              ? "Delegate tasks to peer agents, monitor status, inspect results"
+              : "OPFS inspector · browse files and clear active session snapshot"}
       </div>
     </header>
   );
