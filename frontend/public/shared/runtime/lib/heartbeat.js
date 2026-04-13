@@ -36,7 +36,6 @@
       return {
         tenantId: String(payload?.tenantId || "tenant-dev"),
         userId: String(payload?.userId || "user-001"),
-        agentId: String(payload?.agentId || "agent-main"),
         sessionId: String(payload?.sessionId || "chat-001"),
       };
     }
@@ -104,7 +103,6 @@
         currentMessage: taskBlock,
         tenantId: scope.tenantId,
         userId: scope.userId,
-        agentId: scope.agentId,
         sessionId: scope.sessionId,
         route,
         page,
@@ -227,7 +225,6 @@
       return {
         tenantId: scope.tenantId,
         userId: scope.userId,
-        agentId: scope.agentId,
         sessionId: scope.sessionId,
         model: String(model || payload?.model || RuntimeHeartbeat.DEFAULT_MODEL),
         temperature: Number(temperature),
@@ -327,7 +324,6 @@
       return {
         tenantId: scope.tenantId,
         userId: scope.userId,
-        agentId: scope.agentId,
         sessionId: scope.sessionId,
         model: String(model || payload?.model || RuntimeHeartbeat.DEFAULT_MODEL),
         temperature: Number(temperature),
@@ -351,12 +347,18 @@
 
     static buildAgentRequestHeaders(payload = {}) {
       const scope = RuntimeHeartbeat.getScopeFromPayload(payload);
-      return {
+      const headers = {
         "content-type": "application/json",
         "x-tenant-id": scope.tenantId,
         "x-user-id": scope.userId,
-        "x-agent-id": scope.agentId,
       };
+
+      const agentId = String(payload?.agentId || "").trim();
+      if (agentId) {
+        headers["x-agent-id"] = agentId;
+      }
+
+      return headers;
     }
   }
 

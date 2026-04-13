@@ -174,11 +174,19 @@ async def _delegate_task_handler(
     target_agent = str(args.get("target_agent") or "")
     intent = str(args.get("intent") or "") or None
     delegation_id = str(uuid4())
+    caller_agent_id = str(
+        context.get("agentId")
+        or raw.get("agentId")
+        or raw.get("agent_id")
+        or ""
+    ).strip()
+    if not caller_agent_id:
+        return {"error": "agentId is required"}
 
     try:
         receipt = await run_outbound_delegation(
             delegation_id=delegation_id,
-            from_agent=str(settings.a2a_agent_id),
+            from_agent=caller_agent_id,
             target_agent=target_agent,
             task={"text": task_text},
             intent=intent,
@@ -194,28 +202,12 @@ async def _get_delegation_status_handler(
     context: dict[str, Any],
     raw: dict[str, Any],
 ) -> dict[str, Any]:
-    from ..core.config import get_settings
-    from .delegation_store import get_delegation_store
-
-    settings = get_settings()
-    if not settings.a2a_enabled:
-        return {"error": "A2A is disabled"}
-
-    delegation_id = str(args.get("delegation_id") or "")
-    if not delegation_id:
-        return {"error": "delegation_id is required"}
-
-    record = get_delegation_store().get(delegation_id)
-    if record is None:
-        return {"error": f"delegation {delegation_id!r} not found"}
-
+    _ = (args, context, raw)
     return {
-        "delegationId": record.delegation_id,
-        "status": record.status,
-        "targetAgent": record.target_agent,
-        "updatedAt": record.updated_at.isoformat(),
-        "result": record.result,
-        "error": record.error,
+        "error": (
+            "get_delegation_status is deprecated on backend; "
+            "read delegation state from frontend IndexedDB"
+        ),
     }
 
 

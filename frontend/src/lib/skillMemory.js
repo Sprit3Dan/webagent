@@ -12,6 +12,8 @@
  *   - tools:         "name", "enabled"
  */
 
+import { getOrCreateFrontendInstanceId } from "./frontendIdentity";
+
 const runtimeShared = globalThis?.WebagentRuntimeShared;
 if (!runtimeShared) {
   throw new Error("Shared runtime facade is required");
@@ -29,12 +31,24 @@ export const LLM_SETTINGS_STORE = SKILL_DOCS_STORE;
 export const LLM_PROVIDER_SETTINGS_DOC_ID = "system::settings::llm-providers";
 export const LLM_PROVIDER_SETTINGS_SCOPE = "system::settings";
 export const LLM_PROVIDER_SETTINGS_TITLE = "LLM Provider Settings";
+export const UI_SETTINGS_DOC_ID = "system::settings::ui";
+export const UI_SETTINGS_SCOPE = "system::settings";
+export const UI_SETTINGS_TITLE = "UI Settings";
 
 const DEFAULT_SCOPE = "tenant-dev::user-001::default";
 
 export const CONVERSATION_MEMORY_SCOPE_PREFIX = "conversation-memory";
 export const CONVERSATION_MEMORY_DOC_KIND = "conversation_turn";
 export const CONVERSATION_MEMORY_FACT_KIND = "conversation_fact";
+export const FACT_UPSERT_SIMILARITY_THRESHOLD = 0.94;
+export const FACT_CONTRADICTION_SIMILARITY_THRESHOLD = 0.78;
+export const FACT_CONFIDENCE_BUMP_ON_CONFIRM = 0.08;
+export const FACT_CONFIDENCE_DECAY_ON_CONTRADICTION = 0.2;
+export const FACT_SCORE_CONFIDENCE_WEIGHT = 0.14;
+export const FACT_SCORE_CONFIRMATION_WEIGHT = 0.06;
+export const FACT_SCORE_RECENCY_WEIGHT = 0.08;
+export const A2A_DELEGATION_SCOPE_PREFIX = "a2a-delegations";
+export const A2A_DELEGATION_DOC_KIND = "a2a_delegation";
 
 const reqToPromise = runtimeShared.dbReqToPromise;
 const txDone = runtimeShared.dbTxDone;
@@ -66,6 +80,30 @@ export function buildConversationMemoryScope({
 
 export function isConversationMemoryScope(scope) {
   return String(scope || "").startsWith(`${CONVERSATION_MEMORY_SCOPE_PREFIX}::`);
+}
+
+export function buildA2ADelegationScope({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "",
+} = {}) {
+  const resolvedAgentId = String(agentId || getOrCreateFrontendInstanceId()).trim();
+  return [
+    A2A_DELEGATION_SCOPE_PREFIX,
+    String(tenantId),
+    String(userId),
+    resolvedAgentId || "agent-main",
+  ].join("::");
+}
+
+export function isA2ADelegationScope(scope) {
+  return String(scope || "").startsWith(`${A2A_DELEGATION_SCOPE_PREFIX}::`);
+}
+
+export function buildA2ADelegationDocId(delegationId) {
+  const id = String(delegationId || "").trim();
+  if (!id) throw new Error("delegationId is required");
+  return `a2a::delegation::${id}`;
 }
 
 export function buildConversationTurnMemoryId({
@@ -197,6 +235,154 @@ export async function readSkillDocument(docId) {
   return doc || null;
 }
 
+function normalizeA2ADelegationRecord(input = {}) {
+  const delegationId = String(input?.delegationId || "").trim();
+  if (!delegationId) throw new Error("delegationId is required");
+
+  const status = String(input?.status || "").trim().toLowerCase() || "created";
+  const createdAt = String(input?.createdAt || new Date().toISOString());
+  const updatedAt = String(input?.updatedAt || createdAt);
+
+  return {
+    delegationId,
+    status,
+    targetAgent: String(input?.targetAgent || ""),
+    fromAgent: String(input?.fromAgent || ""),
+    task: input?.task && typeof input.task === "object" ? input.task : {},
+    messages: Array.isArray(input?.messages) ? input.messages : [],
+    result:
+      input?.result && typeof input.result === "object"
+        ? input.result
+        : (input?.result ?? null),
+    error: typeof input?.error === "string" ? input.error : (input?.error ?? null),
+    createdAt,
+    updatedAt,
+  };
+}
+
+export async function upsertA2ADelegationRecord(
+  input,
+  {
+    tenantId = "tenant-dev",
+    userId = "user-001",
+    agentId = "",
+  } = {},
+) {
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, SKILL_DOCS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${SKILL_DOCS_STORE}`);
+  }
+
+  const normalized = normalizeA2ADelegationRecord(input || {});
+  const scope = buildA2ADelegationScope({ tenantId, userId, agentId });
+  const id = buildA2ADelegationDocId(normalized.delegationId);
+  const now = new Date().toISOString();
+  const existing = await readSkillDocument(id);
+
+  const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+  tx.objectStore(SKILL_DOCS_STORE).put({
+    id,
+    scope,
+    kind: A2A_DELEGATION_DOC_KIND,
+    title: `A2A Delegation ${normalized.delegationId.slice(0, 8)}`,
+    text: JSON.stringify(normalized, null, 2),
+    ...normalized,
+    createdAt: existing?.createdAt || normalized.createdAt || now,
+    updatedAt: normalized.updatedAt || now,
+  });
+  await txDone(tx);
+
+  return {
+    id,
+    scope,
+    ...normalized,
+    createdAt: existing?.createdAt || normalized.createdAt || now,
+    updatedAt: normalized.updatedAt || now,
+  };
+}
+
+export async function readA2ADelegationRecord(
+  delegationId,
+  {
+    tenantId = "tenant-dev",
+    userId = "user-001",
+    agentId = "",
+  } = {},
+) {
+  const id = buildA2ADelegationDocId(delegationId);
+  const doc = await readSkillDocument(id);
+  if (!doc || String(doc?.kind || "") !== A2A_DELEGATION_DOC_KIND) return null;
+  const scope = buildA2ADelegationScope({ tenantId, userId, agentId });
+  if (String(doc?.scope || "") !== scope) return null;
+  return doc;
+}
+
+export async function listA2ADelegationRecords(
+  {
+    tenantId = "tenant-dev",
+    userId = "user-001",
+    agentId = "",
+    status = "",
+    limit = 100,
+    offset = 0,
+    sortDesc = true,
+  } = {},
+) {
+  const scope = buildA2ADelegationScope({ tenantId, userId, agentId });
+  const docs = await listSkillDocuments({
+    scope,
+    limit: 10_000,
+    offset: 0,
+    sortDesc,
+  });
+
+  const statusFilter = String(status || "").trim().toLowerCase();
+  const records = docs.filter((doc) => {
+    if (String(doc?.kind || "") !== A2A_DELEGATION_DOC_KIND) return false;
+    if (!statusFilter) return true;
+    return String(doc?.status || "").trim().toLowerCase() === statusFilter;
+  });
+
+  records.sort((a, b) => {
+    const av = String(a?.updatedAt || a?.createdAt || "");
+    const bv = String(b?.updatedAt || b?.createdAt || "");
+    return sortDesc ? bv.localeCompare(av) : av.localeCompare(bv);
+  });
+
+  return pageArray(records, { limit, offset });
+}
+
+export async function clearA2ADelegationRecords(
+  {
+    tenantId = "tenant-dev",
+    userId = "user-001",
+    agentId = "",
+  } = {},
+) {
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, SKILL_DOCS_STORE)) return 0;
+
+  const records = await listA2ADelegationRecords({
+    tenantId,
+    userId,
+    agentId,
+    limit: 10_000,
+    offset: 0,
+    sortDesc: false,
+  });
+
+  if (!records.length) return 0;
+
+  const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+  const store = tx.objectStore(SKILL_DOCS_STORE);
+  for (const row of records) {
+    if (row?.id) store.delete(String(row.id));
+  }
+  await txDone(tx);
+
+  return records.length;
+}
+
 function normalizeProviderRecord(input, index = 0) {
   const id = String(input?.id || `provider-${index + 1}`);
   return {
@@ -216,6 +402,51 @@ function normalizeProviderSettingsPayload(input) {
   const providers = rawProviders.map((item, idx) => normalizeProviderRecord(item, idx));
   const activeProviderId = String(input?.activeProviderId || providers[0]?.id || "");
   return { providers, activeProviderId };
+}
+
+function normalizeA2aConsumerName(value) {
+  const candidate = String(value || "").trim();
+  if (candidate && candidate.toLowerCase() !== "webagent") return candidate;
+  return getOrCreateFrontendInstanceId();
+}
+
+function normalizeUiSettingsPayload(input, defaults = {}) {
+  const hasExplicitA2aEnabled = input && Object.prototype.hasOwnProperty.call(input, "a2aEnabled");
+  const hasExplicitA2aRequireAuth = input && Object.prototype.hasOwnProperty.call(input, "a2aRequireAuth");
+  const toText = (value, fallback = "") => String(value ?? fallback ?? "").trim();
+  const toPositiveInt = (value, fallback) => {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+    return Math.max(1, Number(fallback) || 1);
+  };
+
+  const fallbackA2aEnabled = Boolean(defaults?.a2aEnabled);
+  const fallbackA2aRequireAuth = Boolean(defaults?.a2aRequireAuth);
+
+  return {
+    a2aEnabled: hasExplicitA2aEnabled
+      ? Boolean(input?.a2aEnabled)
+      : fallbackA2aEnabled,
+    a2aAgentId: toText(input?.a2aAgentId, defaults?.a2aAgentId),
+    a2aTransportBackend: toText(input?.a2aTransportBackend, defaults?.a2aTransportBackend || "nats"),
+    a2aNatsUrl: toText(input?.a2aNatsUrl, defaults?.a2aNatsUrl),
+    a2aDiscoveryBaseUrl: toText(input?.a2aDiscoveryBaseUrl, defaults?.a2aDiscoveryBaseUrl),
+    a2aStreamName: toText(input?.a2aStreamName, defaults?.a2aStreamName || "a2a"),
+    a2aSubjectPrefix: toText(input?.a2aSubjectPrefix, defaults?.a2aSubjectPrefix || "a2a"),
+    a2aConsumerName: normalizeA2aConsumerName(
+      toText(input?.a2aConsumerName, defaults?.a2aConsumerName || ""),
+    ),
+    a2aMaxDeliver: toPositiveInt(input?.a2aMaxDeliver, defaults?.a2aMaxDeliver || 5),
+    a2aAckWaitSeconds: toPositiveInt(input?.a2aAckWaitSeconds, defaults?.a2aAckWaitSeconds || 30),
+    a2aExecutionTimeoutSeconds: toPositiveInt(
+      input?.a2aExecutionTimeoutSeconds,
+      defaults?.a2aExecutionTimeoutSeconds || 120,
+    ),
+    a2aRequireAuth: hasExplicitA2aRequireAuth
+      ? Boolean(input?.a2aRequireAuth)
+      : fallbackA2aRequireAuth,
+    a2aSharedSecret: toText(input?.a2aSharedSecret, defaults?.a2aSharedSecret),
+  };
 }
 
 export async function readPersistedLlmProviderSettings() {
@@ -259,6 +490,57 @@ export async function writePersistedLlmProviderSettings(input) {
     id: LLM_PROVIDER_SETTINGS_DOC_ID,
     scope: LLM_PROVIDER_SETTINGS_SCOPE,
     title: LLM_PROVIDER_SETTINGS_TITLE,
+    text: JSON.stringify(normalized, null, 2),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  });
+  await txDone(tx);
+
+  return {
+    ...normalized,
+    updatedAt: now,
+  };
+}
+
+export async function readPersistedUiSettings(defaults = {}) {
+  const doc = await readSkillDocument(UI_SETTINGS_DOC_ID);
+  if (!doc?.text) {
+    return {
+      ...normalizeUiSettingsPayload({}, defaults),
+      updatedAt: null,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(String(doc.text || "{}"));
+    const normalized = normalizeUiSettingsPayload(parsed, defaults);
+    return {
+      ...normalized,
+      updatedAt: doc.updatedAt || doc.createdAt || null,
+    };
+  } catch {
+    return {
+      ...normalizeUiSettingsPayload({}, defaults),
+      updatedAt: doc.updatedAt || doc.createdAt || null,
+    };
+  }
+}
+
+export async function writePersistedUiSettings(input, defaults = {}) {
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, LLM_SETTINGS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${LLM_SETTINGS_STORE}`);
+  }
+
+  const normalized = normalizeUiSettingsPayload(input || {}, defaults);
+  const now = new Date().toISOString();
+  const existing = await readSkillDocument(UI_SETTINGS_DOC_ID);
+
+  const tx = db.transaction(LLM_SETTINGS_STORE, "readwrite");
+  tx.objectStore(LLM_SETTINGS_STORE).put({
+    id: UI_SETTINGS_DOC_ID,
+    scope: UI_SETTINGS_SCOPE,
+    title: UI_SETTINGS_TITLE,
     text: JSON.stringify(normalized, null, 2),
     createdAt: existing?.createdAt || now,
     updatedAt: now,
@@ -327,6 +609,63 @@ function normalizeVector(input) {
     out.push(n);
   }
   return out;
+}
+
+function normalizeFactText(input) {
+  return String(input || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeFactConfidence(input, fallback = 0.6) {
+  const raw = Number(input);
+  const value = Number.isFinite(raw) ? raw : Number(fallback);
+  return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0.6));
+}
+
+function normalizeConfirmedCount(input) {
+  const value = Number(input);
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.trunc(value));
+}
+
+function clamp01(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+function computeFactHybridScore({
+  similarity = 0,
+  confidence = 0.6,
+  confirmedCount = 0,
+  recencyBonus = 0,
+  confidenceWeight = FACT_SCORE_CONFIDENCE_WEIGHT,
+  confirmationWeight = FACT_SCORE_CONFIRMATION_WEIGHT,
+  recencyWeight = FACT_SCORE_RECENCY_WEIGHT,
+} = {}) {
+  const sim = clamp01(similarity);
+  const conf = clamp01(confidence);
+  const confirms = normalizeConfirmedCount(confirmedCount);
+  const confirmationBoost = Math.log2(1 + confirms) * confirmationWeight;
+  const freshnessBoost = clamp01(recencyBonus) * recencyWeight;
+  const score = sim + conf * confidenceWeight + confirmationBoost + freshnessBoost;
+  return clamp01(score);
+}
+
+function areFactsContradictory(leftText, rightText) {
+  const left = normalizeFactText(leftText).toLowerCase();
+  const right = normalizeFactText(rightText).toLowerCase();
+  if (!left || !right) return false;
+  if (left === right) return false;
+
+  const negWords = [" no ", " not ", " never ", " without ", " cannot ", " can't "];
+  const leftNeg = negWords.some((w) => ` ${left} `.includes(w));
+  const rightNeg = negWords.some((w) => ` ${right} `.includes(w));
+  const overlap =
+    left.includes(right) ||
+    right.includes(left) ||
+    left.split(" ").some((token) => token.length > 4 && right.includes(token));
+
+  return overlap && leftNeg !== rightNeg;
 }
 
 function cosineSimilarity(a, b) {
@@ -440,13 +779,17 @@ export async function writeConversationFactMemories({
 
   const normalizedFacts = (Array.isArray(facts) ? facts : [])
     .map((item, idx) => {
-      const text = String(item?.text || "").trim();
+      const text = normalizeFactText(item?.text);
       const embedding = normalizeVector(item?.embedding);
+      const confidence = normalizeFactConfidence(item?.confidence, 0.6);
+      const confirmedCount = normalizeConfirmedCount(item?.confirmedCount || 1);
       if (!text || !embedding.length) return null;
       return {
         id: buildConversationFactMemoryId({ sessionId, turnIndex, factIndex: idx }),
         text,
         embedding,
+        confidence,
+        confirmedCount,
       };
     })
     .filter(Boolean);
@@ -466,11 +809,128 @@ export async function writeConversationFactMemories({
   const now = new Date().toISOString();
   let stored = 0;
 
+  const existingFacts = await listConversationFactMemories({
+    tenantId,
+    userId,
+    agentId,
+    limit: 10_000,
+    offset: 0,
+    sortDesc: true,
+  });
+  const knownFacts = [...existingFacts];
+
   for (let i = 0; i < normalizedFacts.length; i += 1) {
     const fact = normalizedFacts[i];
-    // Use per-record transaction to avoid transaction-lifecycle races under async load.
-    // eslint-disable-next-line no-await-in-loop
-    const existing = await readSkillDocument(fact.id);
+    const factConfidence = normalizeFactConfidence(fact.confidence, 0.6);
+    const factConfirmedCount = normalizeConfirmedCount(fact.confirmedCount || 1);
+
+    let bestSimilar = null;
+    let bestSimilarity = 0;
+
+    for (let j = 0; j < knownFacts.length; j += 1) {
+      const candidate = knownFacts[j];
+      const candidateVec = normalizeVector(candidate?.embedding);
+      if (!candidateVec.length || candidateVec.length !== fact.embedding.length) continue;
+      const similarity = cosineSimilarity(fact.embedding, candidateVec);
+      if (similarity > bestSimilarity) {
+        bestSimilarity = similarity;
+        bestSimilar = candidate;
+      }
+    }
+
+    if (bestSimilar && bestSimilarity >= FACT_UPSERT_SIMILARITY_THRESHOLD) {
+      const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+      const store = tx.objectStore(SKILL_DOCS_STORE);
+
+      const nextConfirmedCount =
+        normalizeConfirmedCount(bestSimilar?.confirmedCount) + factConfirmedCount;
+      const nextConfidence = clamp01(
+        Math.max(
+          normalizeFactConfidence(bestSimilar?.confidence, 0.6),
+          factConfidence,
+        ) + FACT_CONFIDENCE_BUMP_ON_CONFIRM,
+      );
+
+      store.put({
+        ...bestSimilar,
+        id: String(bestSimilar.id),
+        scope,
+        kind: CONVERSATION_MEMORY_FACT_KIND,
+        title: String(bestSimilar?.title || `Conversation Fact ${safeTurnIndex}:${i}`),
+        sessionId: String(bestSimilar?.sessionId || sessionId),
+        turnIndex: Math.max(0, Number(bestSimilar?.turnIndex ?? safeTurnIndex)),
+        factIndex: Math.max(0, Number(bestSimilar?.factIndex ?? i)),
+        text: normalizeFactText(fact.text),
+        embedding: fact.embedding,
+        embeddingModel: String(embeddingModel || bestSimilar?.embeddingModel || ""),
+        dimensions: fact.embedding.length,
+        confidence: nextConfidence,
+        confirmedCount: nextConfirmedCount,
+        createdAt: String(bestSimilar?.createdAt || now),
+        updatedAt: now,
+      });
+
+      await txDone(tx);
+      stored += 1;
+
+      const idx = knownFacts.findIndex((row) => String(row?.id || "") === String(bestSimilar.id));
+      if (idx >= 0) {
+        knownFacts[idx] = {
+          ...knownFacts[idx],
+          text: normalizeFactText(fact.text),
+          embedding: fact.embedding,
+          confidence: nextConfidence,
+          confirmedCount: nextConfirmedCount,
+          updatedAt: now,
+        };
+      }
+
+      continue;
+    }
+
+    let contradiction = null;
+    let contradictionSimilarity = 0;
+
+    for (let j = 0; j < knownFacts.length; j += 1) {
+      const candidate = knownFacts[j];
+      const candidateVec = normalizeVector(candidate?.embedding);
+      if (!candidateVec.length || candidateVec.length !== fact.embedding.length) continue;
+      const similarity = cosineSimilarity(fact.embedding, candidateVec);
+      if (similarity < FACT_CONTRADICTION_SIMILARITY_THRESHOLD) continue;
+      if (!areFactsContradictory(fact.text, candidate?.text)) continue;
+      if (similarity > contradictionSimilarity) {
+        contradictionSimilarity = similarity;
+        contradiction = candidate;
+      }
+    }
+
+    if (contradiction) {
+      const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+      const store = tx.objectStore(SKILL_DOCS_STORE);
+
+      const decayedConfidence = clamp01(
+        normalizeFactConfidence(contradiction?.confidence, 0.6) -
+          FACT_CONFIDENCE_DECAY_ON_CONTRADICTION,
+      );
+
+      store.put({
+        ...contradiction,
+        id: String(contradiction.id),
+        confidence: decayedConfidence,
+        updatedAt: now,
+      });
+
+      await txDone(tx);
+
+      const idx = knownFacts.findIndex((row) => String(row?.id || "") === String(contradiction.id));
+      if (idx >= 0) {
+        knownFacts[idx] = {
+          ...knownFacts[idx],
+          confidence: decayedConfidence,
+          updatedAt: now,
+        };
+      }
+    }
 
     const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
     const store = tx.objectStore(SKILL_DOCS_STORE);
@@ -483,17 +943,36 @@ export async function writeConversationFactMemories({
       sessionId: String(sessionId),
       turnIndex: safeTurnIndex,
       factIndex: i,
-      text: fact.text,
+      text: normalizeFactText(fact.text),
       embedding: fact.embedding,
       embeddingModel: String(embeddingModel || ""),
       dimensions: fact.embedding.length,
-      createdAt: existing?.createdAt || now,
+      confidence: factConfidence,
+      confirmedCount: factConfirmedCount,
+      createdAt: now,
       updatedAt: now,
     });
 
-    // eslint-disable-next-line no-await-in-loop
     await txDone(tx);
     stored += 1;
+
+    knownFacts.push({
+      id: fact.id,
+      scope,
+      kind: CONVERSATION_MEMORY_FACT_KIND,
+      title: `Conversation Fact ${safeTurnIndex}:${i}`,
+      sessionId: String(sessionId),
+      turnIndex: safeTurnIndex,
+      factIndex: i,
+      text: normalizeFactText(fact.text),
+      embedding: fact.embedding,
+      embeddingModel: String(embeddingModel || ""),
+      dimensions: fact.embedding.length,
+      confidence: factConfidence,
+      confirmedCount: factConfirmedCount,
+      createdAt: now,
+      updatedAt: now,
+    });
   }
 
   return {
@@ -541,6 +1020,73 @@ export async function listConversationFactMemories({
   });
 
   return pageArray(facts, { limit, offset });
+}
+
+export async function forgetConversationFactsByText({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  query = "",
+} = {}) {
+  const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
+  const needle = normalizeFactText(query).toLowerCase();
+
+  if (!needle) {
+    return {
+      scope,
+      query: "",
+      deleted: 0,
+      matchedIds: [],
+      skipped: true,
+    };
+  }
+
+  const candidates = await listConversationFactMemories({
+    tenantId,
+    userId,
+    agentId,
+    limit: 10_000,
+    offset: 0,
+    sortDesc: true,
+  });
+
+  const matched = candidates.filter((doc) =>
+    normalizeFactText(doc?.text).toLowerCase().includes(needle),
+  );
+
+  if (!matched.length) {
+    return {
+      scope,
+      query: needle,
+      deleted: 0,
+      matchedIds: [],
+      skipped: false,
+    };
+  }
+
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, SKILL_DOCS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${SKILL_DOCS_STORE}`);
+  }
+
+  const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+  const store = tx.objectStore(SKILL_DOCS_STORE);
+
+  for (let i = 0; i < matched.length; i += 1) {
+    const row = matched[i];
+    if (!row?.id) continue;
+    store.delete(String(row.id));
+  }
+
+  await txDone(tx);
+
+  return {
+    scope,
+    query: needle,
+    deleted: matched.length,
+    matchedIds: matched.map((row) => String(row?.id || "")).filter(Boolean),
+    skipped: false,
+  };
 }
 
 export async function listConversationTurnMemories({
@@ -606,10 +1152,9 @@ export async function searchConversationMemoryKnn({
     sortDesc: true,
   });
 
-  const candidates = docs.filter((doc) => {
-    const kind = String(doc?.kind || "");
-    return kind === CONVERSATION_MEMORY_DOC_KIND || kind === CONVERSATION_MEMORY_FACT_KIND;
-  });
+  const candidates = docs.filter(
+    (doc) => String(doc?.kind || "") === CONVERSATION_MEMORY_FACT_KIND,
+  );
 
   const nowMs = Date.now();
   const safeRecencyWeight = Math.max(0, Math.min(1, Number(recencyWeight) || 0));
@@ -646,34 +1191,16 @@ export async function searchConversationMemoryKnn({
     const sessionBonus =
       preferredSessionId && docSessionId === preferredSessionId ? safeSessionBoost : 0;
 
-    let baseScore = 0;
-
-    if (kind === CONVERSATION_MEMORY_FACT_KIND) {
-      baseScore = cosineSimilarity(query, doc?.embedding || []);
-      const score = Math.min(1, baseScore + recencyBonus + sessionBonus);
-
-      return {
-        id: String(doc?.id || ""),
-        score,
-        baseScore,
-        recencyBonus,
-        sessionBonus,
-        kind,
-        turnIndex: Number(doc?.turnIndex || 0),
-        sessionId: docSessionId,
-        text: String(doc?.text || ""),
-        userText: "",
-        assistantText: "",
-        factText: String(doc?.text || ""),
-        updatedAt,
-        source: doc,
-      };
-    }
-
-    const userScore = cosineSimilarity(query, doc?.userEmbedding || []);
-    const assistantScore = cosineSimilarity(query, doc?.assistantEmbedding || []);
-    baseScore = Math.max(userScore, assistantScore);
-    const score = Math.min(1, baseScore + recencyBonus + sessionBonus);
+    const baseScore = cosineSimilarity(query, doc?.embedding || []);
+    const confidence = normalizeFactConfidence(doc?.confidence, 0.6);
+    const confirmedCount = normalizeConfirmedCount(doc?.confirmedCount);
+    const hybridScore = computeFactHybridScore({
+      similarity: baseScore,
+      confidence,
+      confirmedCount,
+      recencyBonus,
+    });
+    const score = clamp01(hybridScore + sessionBonus);
 
     return {
       id: String(doc?.id || ""),
@@ -681,13 +1208,15 @@ export async function searchConversationMemoryKnn({
       baseScore,
       recencyBonus,
       sessionBonus,
+      confidence,
+      confirmedCount,
       kind,
       turnIndex: Number(doc?.turnIndex || 0),
       sessionId: docSessionId,
-      text: String(doc?.text || ""),
-      userText: String(doc?.userText || ""),
-      assistantText: String(doc?.assistantText || ""),
-      factText: "",
+      text: normalizeFactText(doc?.text),
+      userText: "",
+      assistantText: "",
+      factText: normalizeFactText(doc?.text),
       updatedAt,
       source: doc,
     };
@@ -720,29 +1249,24 @@ export function buildConversationMemoryPromptBlock(hits) {
   const list = Array.isArray(hits) ? hits : [];
   if (!list.length) return "";
 
-  const lines = ["## Relevant Prior Memories", "", "We had related conversations before:"];
+  const lines = [
+    "## Relevant Prior Facts",
+    "",
+    "Use these as candidate prior facts. Prefer higher-confidence and newer facts. If uncertain or conflicting, ask the user to confirm.",
+    "",
+  ];
 
   for (let i = 0; i < list.length; i += 1) {
     const item = list[i];
     const score = Number(item?.score || 0).toFixed(3);
-    const sessionId = String(item?.sessionId || "");
-    const turnIndex = Math.max(0, Number(item?.turnIndex || 0));
-    const userText = String(item?.userText || "").replace(/\s+/g, " ").trim();
-    const assistantText = String(item?.assistantText || "").replace(/\s+/g, " ").trim();
-    const factText = String(item?.factText || "").replace(/\s+/g, " ").trim();
-    const kind = String(item?.kind || "");
+    const confidence = normalizeFactConfidence(item?.confidence, 0.6).toFixed(2);
+    const updatedAt = String(item?.updatedAt || "").trim() || "unknown";
+    const factText = normalizeFactText(item?.factText || item?.text || "");
 
-    lines.push(`- [score=${score}] session=${sessionId} turn=${turnIndex} kind=${kind}`);
+    if (!factText) continue;
 
-    if (factText) {
-      lines.push(`  - fact: ${factText.slice(0, 280)}`);
-      continue;
-    }
-
-    lines.push(
-      `  - user: ${userText.slice(0, 280)}`,
-      `  - assistant: ${assistantText.slice(0, 280)}`,
-    );
+    lines.push(`- fact: ${factText.slice(0, 320)}`);
+    lines.push(`  confidence: ${confidence} · freshness: ${updatedAt} · score: ${score}`);
   }
 
   return lines.join("\n").trim();

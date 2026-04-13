@@ -54,9 +54,14 @@ function AppShell() {
     saveLlmSettings,
     delegations,
     a2aEnabled,
+    a2aBackendDefaults,
+    setA2aEnabledPreference,
+    setA2aConfigDefaultsPreference,
     refreshDelegations,
     delegateTask,
   } = useChatSession();
+
+  const a2aBackendDefaultEnabled = Boolean(a2aBackendDefaults?.a2aEnabled);
 
   // Probe A2A health when navigating to the A2A pane
   useEffect(() => {
@@ -140,11 +145,17 @@ function AppShell() {
           onAddProvider={addLlmProvider}
           onRemoveProvider={removeLlmProvider}
           onSave={saveLlmSettings}
+          a2aEnabled={a2aEnabled}
+          a2aBackendDefaults={a2aBackendDefaults}
+          onA2aEnabledChange={setA2aEnabledPreference}
+          onA2aConfigChange={setA2aConfigDefaultsPreference}
         />
       ) : route === ROUTES.A2A ? (
         <A2APane
           delegations={delegations}
           a2aEnabled={a2aEnabled}
+          a2aBackendDefaultEnabled={a2aBackendDefaultEnabled}
+          onA2aEnabledChange={setA2aEnabledPreference}
           onRefresh={refreshDelegations}
           onDelegate={delegateTask}
         />

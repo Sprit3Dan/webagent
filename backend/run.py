@@ -3,8 +3,11 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+from copy import deepcopy
+from typing import Any
 
 import uvicorn
+from uvicorn.config import LOGGING_CONFIG
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -12,6 +15,26 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_log_config(level: str) -> dict[str, Any]:
+    cfg = deepcopy(LOGGING_CONFIG)
+    lvl = str(level or "info").upper()
+
+    cfg["root"] = {
+        "level": lvl,
+        "handlers": ["default"],
+    }
+
+    loggers = cfg.setdefault("loggers", {})
+    for name in ("app", "app.main", "app.services", "uvicorn", "uvicorn.error", "uvicorn.access"):
+        logger_cfg = loggers.get(name)
+        if not isinstance(logger_cfg, dict):
+            logger_cfg = {}
+        logger_cfg["level"] = lvl
+        loggers[name] = logger_cfg
+
+    return cfg
 
 
 def main() -> int:
@@ -35,6 +58,7 @@ def main() -> int:
         host=host,
         port=port,
         log_level=log_level,
+        log_config=_build_log_config(log_level),
         reload=reload_enabled,
     )
     return 0

@@ -22,6 +22,38 @@ DelegationHandler = Callable[[dict[str, Any]], Awaitable[None]]
 StatusHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+def _normalize_inbound_selector(selector: str, default_agent_id: str) -> str:
+    raw = str(selector or "").strip()
+    if not raw:
+        return str(default_agent_id or "").strip() or ">"
+
+    if raw in {"*", ">"}:
+        return raw
+
+    # NATS wildcards must occupy the whole token. Patterns like "webagent-*"
+    # are invalid wildcard tokens in subject filters, so broaden to ">".
+    if "*" in raw or ">" in raw:
+        return ">"
+
+    return raw
+
+
+def _selector_token(value: str) -> str:
+    token_parts: list[str] = []
+    for ch in str(value or ""):
+        if ch.isalnum() or ch in {"-", "_"}:
+            token_parts.append(ch)
+        elif ch == "*":
+            token_parts.append("star")
+        elif ch == ">":
+            token_parts.append("all")
+        else:
+            token_parts.append("-")
+
+    token = "".join(token_parts).strip("-_")
+    return token or "all"
+
+
 class A2ATransport:
     def __init__(
         self,
@@ -31,6 +63,7 @@ class A2ATransport:
         subject_prefix: str,
         self_agent_id: str,
         consumer_name: str,
+        inbound_agent_pattern: str = "",
         max_deliver: int = 5,
         ack_wait_seconds: int = 30,
     ) -> None:
@@ -41,6 +74,9 @@ class A2ATransport:
         self._consumer_name = consumer_name
         self._max_deliver = max_deliver
         self._ack_wait_ns = ack_wait_seconds * 10**9  # NATS expects nanoseconds
+        pattern = str(inbound_agent_pattern or "").strip()
+        self._inbound_agent_selector = _normalize_inbound_selector(pattern, self._agent_id)
+        self._consumer_selector_token = _selector_token(self._inbound_agent_selector)
 
         self._nc: Any = None   # nats.aio.client.Client
         self._js: Any = None   # JetStream context
@@ -50,11 +86,11 @@ class A2ATransport:
 
     @property
     def delegation_subject(self) -> str:
-        return f"{self._subject_prefix}.delegations.{self._agent_id}"
+        return f"{self._subject_prefix}.delegations.{self._inbound_agent_selector}"
 
     @property
     def status_subject(self) -> str:
-        return f"{self._subject_prefix}.status.{self._agent_id}"
+        return f"{self._subject_prefix}.status.{self._inbound_agent_selector}"
 
     def _delegation_subject_for(self, agent_id: str) -> str:
         return f"{self._subject_prefix}.delegations.{agent_id}"
@@ -109,7 +145,7 @@ class A2ATransport:
         delegation_task = asyncio.create_task(
             self._consume_loop(
                 subject=self.delegation_subject,
-                durable_name=f"{self._consumer_name}-delegation",
+                durable_name=f"{self._consumer_name}-{self._consumer_selector_token}-delegation",
                 handler=delegation_handler,
             ),
             name=f"a2a-delegation-{self._agent_id}",
@@ -117,7 +153,7 @@ class A2ATransport:
         status_task = asyncio.create_task(
             self._consume_loop(
                 subject=self.status_subject,
-                durable_name=f"{self._consumer_name}-status",
+                durable_name=f"{self._consumer_name}-{self._consumer_selector_token}-status",
                 handler=status_handler,
             ),
             name=f"a2a-status-{self._agent_id}",
@@ -154,7 +190,11 @@ class A2ATransport:
         while True:
             try:
                 sub = await self._js.pull_subscribe(subject, durable_name)
-                logger.info("a2a_transport: pull consumer ready on %s", subject)
+                logger.info(
+                    "a2a_transport: pull consumer ready subject=%s durable=%s",
+                    subject,
+                    durable_name,
+                )
                 while True:
                     try:
                         msgs = await sub.fetch(batch=10, timeout=5.0)
@@ -195,14 +235,44 @@ class A2ATransport:
             await msg.nak()
             return
 
+        delegation_id = envelope.get("delegation_id")
+        message_id = envelope.get("message_id")
+        event_id = envelope.get("event_id")
+        from_agent = envelope.get("from_agent")
+        to_agent = envelope.get("to_agent")
+        status = envelope.get("status")
+
+        logger.debug(
+            "a2a_transport: inbound message subject=%s delegation_id=%s message_id=%s event_id=%s status=%s from_agent=%s to_agent=%s",
+            subject,
+            delegation_id,
+            message_id,
+            event_id,
+            status,
+            from_agent,
+            to_agent,
+        )
+
         try:
             await handler(envelope)
             await msg.ack()
+            logger.debug(
+                "a2a_transport: acked message subject=%s delegation_id=%s message_id=%s event_id=%s",
+                subject,
+                delegation_id,
+                message_id,
+                event_id,
+            )
         except Exception as exc:
             logger.error(
-                "a2a_transport: handler error on %s delegation_id=%s: %s",
+                "a2a_transport: handler error subject=%s delegation_id=%s message_id=%s event_id=%s status=%s from_agent=%s to_agent=%s error=%s",
                 subject,
-                envelope.get("delegation_id"),
+                delegation_id,
+                message_id,
+                event_id,
+                status,
+                from_agent,
+                to_agent,
                 exc,
                 exc_info=True,
             )

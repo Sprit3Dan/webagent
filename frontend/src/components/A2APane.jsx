@@ -190,7 +190,14 @@ function DelegationDetail({ delegation }) {
   );
 }
 
-export default function A2APane({ delegations = [], onRefresh, onDelegate, a2aEnabled }) {
+export default function A2APane({
+  delegations = [],
+  onRefresh,
+  onDelegate,
+  a2aEnabled,
+  a2aBackendDefaultEnabled = false,
+  onA2aEnabledChange,
+}) {
   const [selected, setSelected] = useState(null);
   const [taskText, setTaskText] = useState("");
   const [targetAgent, setTargetAgent] = useState("");
@@ -199,10 +206,15 @@ export default function A2APane({ delegations = [], onRefresh, onDelegate, a2aEn
   const [delegateError, setDelegateError] = useState("");
   const pollRef = useRef(null);
 
+  const safeRefresh = () => {
+    if (!a2aEnabled) return;
+    onRefresh?.();
+  };
+
   // Auto-refresh
   useEffect(() => {
     if (!a2aEnabled) return;
-    pollRef.current = setInterval(onRefresh, POLL_INTERVAL_MS);
+    pollRef.current = setInterval(() => safeRefresh(), POLL_INTERVAL_MS);
     return () => clearInterval(pollRef.current);
   }, [a2aEnabled, onRefresh]);
 
@@ -223,7 +235,7 @@ export default function A2APane({ delegations = [], onRefresh, onDelegate, a2aEn
       if (result?.error) setDelegateError(result.error);
       else {
         setTaskText("");
-        onRefresh();
+        safeRefresh();
       }
     } catch (err) {
       setDelegateError(String(err));
@@ -234,8 +246,21 @@ export default function A2APane({ delegations = [], onRefresh, onDelegate, a2aEn
 
   if (!a2aEnabled) {
     return (
-      <div style={{ padding: 24, color: "#6f8499", fontSize: 14 }}>
-        A2A is disabled. Set <code>A2A_ENABLED=true</code> on the backend to enable agent delegation.
+      <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ color: "#6f8499", fontSize: 14 }}>
+          A2A delegation is currently disabled in UI settings.
+        </div>
+        <div style={{ color: "#8fb0c9", fontSize: 12 }}>
+          Backend default is <code>{a2aBackendDefaultEnabled ? "enabled" : "disabled"}</code>.
+        </div>
+        <div>
+          <button
+            onClick={() => onA2aEnabledChange?.(true)}
+            style={buttonStyle("primary")}
+          >
+            Enable A2A in UI
+          </button>
+        </div>
       </div>
     );
   }
@@ -302,7 +327,7 @@ export default function A2APane({ delegations = [], onRefresh, onDelegate, a2aEn
             <h3 style={{ margin: 0, color: "#cfe0ef", fontSize: 14 }}>
               Delegations ({delegations.length})
             </h3>
-            <button onClick={onRefresh} style={buttonStyle()}>Refresh</button>
+            <button onClick={safeRefresh} style={buttonStyle()}>Refresh</button>
           </div>
           <div style={{
             maxHeight: "40vh",

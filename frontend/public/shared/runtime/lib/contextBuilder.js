@@ -64,7 +64,6 @@
     static buildIdentitySection({
       tenantId = "tenant-dev",
       userId = "user-001",
-      agentId = "agent-main",
       sessionId = "chat-001",
       environment = "browser",
     } = {}) {
@@ -87,7 +86,6 @@ You are webagent, a frontend-first assistant with service-worker tools.
     static buildRuntimeMetadataBlock({
       tenantId,
       userId,
-      agentId,
       sessionId,
       route = "/",
       page = "chat",
@@ -144,7 +142,6 @@ You are webagent, a frontend-first assistant with service-worker tools.
       currentMessage = "",
       tenantId = "tenant-dev",
       userId = "user-001",
-      agentId = "agent-main",
       sessionId = "chat-001",
       route = "/",
       page = "chat",
@@ -160,7 +157,6 @@ You are webagent, a frontend-first assistant with service-worker tools.
       const identity = RuntimeContextBuilder.buildIdentitySection({
         tenantId,
         userId,
-        agentId,
         sessionId,
         environment,
       });
@@ -176,7 +172,6 @@ You are webagent, a frontend-first assistant with service-worker tools.
       const runtimeBlock = RuntimeContextBuilder.buildRuntimeMetadataBlock({
         tenantId,
         userId,
-        agentId,
         sessionId,
         route,
         page,

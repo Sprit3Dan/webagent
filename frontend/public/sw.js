@@ -228,33 +228,44 @@ async function handlePushEvent(event) {
 
 	console.info("[sw.push] received", payload);
 
-	const heartbeatResult = await runHeartbeatPushFlow(payload);
+	const a2aUpdate = normalizeA2APushUpdate(payload);
+	let heartbeatResult = null;
 
-	await appendHeartbeatAssistantNoteToSnapshot({
-		payload,
-		heartbeatResult,
-	});
-
-	await notifyOpenClients({
-		type: "push.message",
-		payload,
-		heartbeat: heartbeatResult,
-		now: nowIso(),
-	});
-
-	if (heartbeatResult) {
+	if (a2aUpdate) {
 		await notifyOpenClients({
-			type: "heartbeat.assistant_note",
-			message: {
-				role: "assistant",
-				content: heartbeatResult.assistantNote,
-				timestamp: heartbeatResult.generatedAt,
-			},
-			stats: {
-				pendingCount: heartbeatResult.pendingCount,
-				completedCount: heartbeatResult.completedCount,
-			},
+			type: "a2a.delegation.update",
+			update: a2aUpdate,
+			now: nowIso(),
 		});
+	} else {
+		heartbeatResult = await runHeartbeatPushFlow(payload);
+
+		await appendHeartbeatAssistantNoteToSnapshot({
+			payload,
+			heartbeatResult,
+		});
+
+		await notifyOpenClients({
+			type: "push.message",
+			payload,
+			heartbeat: heartbeatResult,
+			now: nowIso(),
+		});
+
+		if (heartbeatResult) {
+			await notifyOpenClients({
+				type: "heartbeat.assistant_note",
+				message: {
+					role: "assistant",
+					content: heartbeatResult.assistantNote,
+					timestamp: heartbeatResult.generatedAt,
+				},
+				stats: {
+					pendingCount: heartbeatResult.pendingCount,
+					completedCount: heartbeatResult.completedCount,
+				},
+			});
+		}
 	}
 
 	if (
@@ -294,6 +305,29 @@ async function notifyOpenClients(message) {
 			void err;
 		}
 	}
+}
+
+function normalizeA2APushUpdate(payload) {
+	if (!payload || typeof payload !== "object") return null;
+	if (String(payload.type || "").trim() !== "a2a.delegation.update") return null;
+
+	const delegationId = String(payload.delegationId || "").trim();
+	const status = String(payload.status || "").trim().toLowerCase();
+	if (!delegationId || !status) return null;
+
+	return {
+		type: "a2a.delegation.update",
+		delegationId,
+		status,
+		fromAgent: typeof payload.fromAgent === "string" ? payload.fromAgent : "",
+		targetAgent: typeof payload.targetAgent === "string" ? payload.targetAgent : "",
+		result: payload.result ?? null,
+		error: typeof payload.error === "string" ? payload.error : null,
+		updatedAt:
+			typeof payload.updatedAt === "string" && payload.updatedAt.trim()
+				? payload.updatedAt
+				: nowIso(),
+	};
 }
 
 const runtimeHeartbeat = runtimeShared.RuntimeHeartbeat;

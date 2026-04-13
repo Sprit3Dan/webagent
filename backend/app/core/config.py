@@ -41,11 +41,11 @@ class Settings(BaseSettings):
 
     # A2A (Agent-to-Agent delegation)
     a2a_enabled: bool = Field(default=False, alias="A2A_ENABLED")
-    a2a_agent_id: Optional[str] = Field(default=None, alias="A2A_AGENT_ID")
+    a2a_agent_id: Optional[str] = Field(default="webagent", alias="A2A_AGENT_ID")
     a2a_transport_backend: str = Field(default="nats", alias="A2A_TRANSPORT_BACKEND")
-    a2a_discovery_base_url: Optional[str] = Field(default=None, alias="A2A_DISCOVERY_BASE_URL")
+    a2a_discovery_base_url: Optional[str] = Field(default="http://a2a-discovery:8080", alias="A2A_DISCOVERY_BASE_URL")
     a2a_require_auth: bool = Field(default=False, alias="A2A_REQUIRE_AUTH")
-    a2a_shared_secret: Optional[str] = Field(default=None, alias="A2A_SHARED_SECRET")
+    a2a_shared_secret: Optional[str] = Field(default="change-me-a2a-secret", alias="A2A_SHARED_SECRET")
     a2a_clock_skew_seconds: int = Field(default=30, alias="A2A_CLOCK_SKEW_SECONDS")
     a2a_nonce_ttl_seconds: int = Field(default=300, alias="A2A_NONCE_TTL_SECONDS")
     # NATS JetStream transport
@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     a2a_stream_name: str = Field(default="a2a", alias="A2A_STREAM_NAME")
     a2a_subject_prefix: str = Field(default="a2a", alias="A2A_SUBJECT_PREFIX")
     a2a_consumer_name: str = Field(default="webagent", alias="A2A_CONSUMER_NAME")
+    a2a_inbound_agent_pattern: str = Field(default="", alias="A2A_INBOUND_AGENT_PATTERN")
     a2a_max_deliver: int = Field(default=5, alias="A2A_MAX_DELIVER")
     a2a_ack_wait_seconds: int = Field(default=30, alias="A2A_ACK_WAIT_SECONDS")
     a2a_execution_timeout_seconds: int = Field(default=120, alias="A2A_EXECUTION_TIMEOUT_SECONDS")
@@ -66,14 +67,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_a2a_settings(self) -> "Settings":
-        if self.a2a_enabled:
-            if not self.a2a_agent_id:
-                raise ValueError("A2A_AGENT_ID is required when A2A_ENABLED=true")
-            if not self.a2a_discovery_base_url:
-                raise ValueError("A2A_DISCOVERY_BASE_URL is required when A2A_ENABLED=true")
-        if self.a2a_require_auth:
-            if not self.a2a_shared_secret:
-                raise ValueError("A2A_SHARED_SECRET is required when A2A_REQUIRE_AUTH=true")
+        if not self.a2a_agent_id:
+            self.a2a_agent_id = "webagent"
+        if not self.a2a_inbound_agent_pattern:
+            self.a2a_inbound_agent_pattern = str(self.a2a_agent_id)
+        if not self.a2a_discovery_base_url:
+            self.a2a_discovery_base_url = "http://a2a-discovery:8080"
+        if not self.a2a_shared_secret:
+            self.a2a_shared_secret = "change-me-a2a-secret"
         return self
 
     @field_validator("cors_origins", mode="before")

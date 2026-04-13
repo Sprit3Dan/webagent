@@ -23,6 +23,8 @@ export function normalizeRoute(pathname) {
   const route = typeof pathname === "string" ? pathname.trim() : "";
   if (route === ROUTES.STORAGE) return ROUTES.STORAGE;
   if (route === ROUTES.SETTINGS) return ROUTES.SETTINGS;
+  if (route === ROUTES.A2A) return ROUTES.A2A;
+  if (route === "/api" || route.startsWith("/api/")) return route;
   return ROUTES.CHAT;
 }
 
@@ -36,6 +38,10 @@ export function isStorageRoute(pathname) {
 
 export function isSettingsRoute(pathname) {
   return normalizeRoute(pathname) === ROUTES.SETTINGS;
+}
+
+export function isA2aRoute(pathname) {
+  return normalizeRoute(pathname) === ROUTES.A2A;
 }
 
 export function currentRoute() {

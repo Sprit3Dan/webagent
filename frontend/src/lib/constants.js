@@ -1,14 +1,13 @@
 export const CONTEXT = {
   tenantId: "tenant-dev",
   userId: "user-001",
-  agentId: "agent-main",
   sessionId: "chat-001",
   model: "nemotron-30b",
   temperature: 0.2,
 };
 
 export const SNAPSHOT_FILE_NAME =
-  `${CONTEXT.tenantId}__${CONTEXT.agentId}__${CONTEXT.sessionId}.json`;
+  `${CONTEXT.tenantId}__${CONTEXT.sessionId}.json`;
 
 
 

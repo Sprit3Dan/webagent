@@ -1,13 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAppContext } from "../context/AppContext";
-import { CONTEXT, ROUTES, SNAPSHOT_FILE_NAME } from "../lib/constants";
+import { CONTEXT, ROUTES } from "../lib/constants";
 import {
-  clearSnapshotFromOpfs,
   getOpfsRoot,
   readOpfsFileByPath,
-  readSnapshotFromOpfs,
   walkOpfs,
-  writeSnapshotToOpfs,
 } from "../lib/opfs";
 import { normalizeRoute, parseJsonSafe } from "../lib/utils";
 import { postJsonAndConsumeSse } from "../lib/sse";
@@ -18,16 +15,20 @@ import {
   toFrontendToolMessage,
 } from "../lib/frontendTools";
 import { createAndRegisterSkill } from "../lib/skills";
+import useA2ADelegation from "./useA2ADelegation";
+import useLlmProviderSettings from "./useLlmProviderSettings";
+import useChatNavigation from "./useChatNavigation";
+import useSessionStorageSync from "./useSessionStorageSync";
 import {
   buildConversationMemoryPromptBlock,
+  clearA2ADelegationRecords,
+  forgetConversationFactsByText,
   listAllSkillMemoryRecords,
   listConversationFactMemories,
   listStoreRecords,
-  readPersistedLlmProviderSettings,
   readSkillDocument,
   searchConversationMemoryKnn,
   writeConversationFactMemories,
-  writePersistedLlmProviderSettings,
 } from "../lib/skillMemory";
 import {
   buildTelemetryText,
@@ -41,6 +42,7 @@ import {
 } from "../lib/chatState";
 import { buildContextForLlm } from "../lib/contextBuilder";
 import { WEBGPU_EMBEDDINGS_DEFAULTS, embedText } from "../lib/webgpuEmbeddings";
+import { getOrCreateFrontendInstanceId } from "../lib/frontendIdentity";
 
 const SLIDING_WINDOW_ROUNDS = 10;
 const MEMORY_KNN_TOP_K = 12;
@@ -52,6 +54,7 @@ const MEMORY_EMBED_DEVICE = WEBGPU_EMBEDDINGS_DEFAULTS.device;
 const FACT_EXTRACTION_MAX_FACTS = 3;
 const FACT_EXTRACTION_MIN_USER_CHARS = 12;
 const FACT_DEDUP_KNN_THRESHOLD = 0.95;
+const CHAT_RUNTIME_AGENT_ID = getOrCreateFrontendInstanceId();
 
 function pickSlidingWindowMessages(messages, rounds = SLIDING_WINDOW_ROUNDS) {
   const all = normalizeMessages(Array.isArray(messages) ? messages : []);
@@ -83,6 +86,10 @@ function summarizeMemoryHits(hits) {
       avgRecencyBonus: 0,
       topSessionBonus: 0,
       avgSessionBonus: 0,
+      topConfidence: 0,
+      avgConfidence: 0,
+      topConfirmedCount: 0,
+      avgConfirmedCount: 0,
       sessions: [],
       turnIndexes: [],
     };
@@ -92,6 +99,8 @@ function summarizeMemoryHits(hits) {
   const baseScores = list.map((item) => Number(item?.baseScore || item?.score || 0));
   const recencyBonuses = list.map((item) => Number(item?.recencyBonus || 0));
   const sessionBonuses = list.map((item) => Number(item?.sessionBonus || 0));
+  const confidences = list.map((item) => Number(item?.confidence || 0));
+  const confirmedCounts = list.map((item) => Number(item?.confirmedCount || 0));
 
   const avgScore = scores.reduce((acc, n) => acc + n, 0) / scores.length;
   const avgBaseScore = baseScores.reduce((acc, n) => acc + n, 0) / baseScores.length;
@@ -99,6 +108,9 @@ function summarizeMemoryHits(hits) {
     recencyBonuses.reduce((acc, n) => acc + n, 0) / recencyBonuses.length;
   const avgSessionBonus =
     sessionBonuses.reduce((acc, n) => acc + n, 0) / sessionBonuses.length;
+  const avgConfidence = confidences.reduce((acc, n) => acc + n, 0) / confidences.length;
+  const avgConfirmedCount =
+    confirmedCounts.reduce((acc, n) => acc + n, 0) / confirmedCounts.length;
 
   const sessions = Array.from(
     new Set(list.map((item) => String(item?.sessionId || "")).filter(Boolean)),
@@ -118,6 +130,10 @@ function summarizeMemoryHits(hits) {
     avgRecencyBonus,
     topSessionBonus: Math.max(...sessionBonuses),
     avgSessionBonus,
+    topConfidence: Math.max(...confidences),
+    avgConfidence,
+    topConfirmedCount: Math.max(...confirmedCounts),
+    avgConfirmedCount,
     sessions,
     turnIndexes,
   };
@@ -129,6 +145,10 @@ function logMemoryRetrieval({
   minScore = MEMORY_MIN_SCORE_FLOOR,
   topK = MEMORY_KNN_TOP_K,
   durationMs = 0,
+  candidateCount = 0,
+  rawHitCount = 0,
+  dedupedHitCount = 0,
+  injectedCount = 0,
 } = {}) {
   const summary = summarizeMemoryHits(hits);
   console.info("[memory:knn] retrieval", {
@@ -136,6 +156,11 @@ function logMemoryRetrieval({
     minScore,
     topK,
     durationMs: Number(durationMs) || 0,
+    candidateCount: Number(candidateCount) || 0,
+    rawHitCount: Number(rawHitCount) || 0,
+    dedupedHitCount: Number(dedupedHitCount) || 0,
+    dedupRemoved: Math.max(0, (Number(rawHitCount) || 0) - (Number(dedupedHitCount) || 0)),
+    injectedCount: Number(injectedCount) || 0,
     hitCount: summary.count,
     topScore: summary.topScore,
     avgScore: summary.avgScore,
@@ -145,6 +170,10 @@ function logMemoryRetrieval({
     avgRecencyBonus: summary.avgRecencyBonus,
     topSessionBonus: summary.topSessionBonus,
     avgSessionBonus: summary.avgSessionBonus,
+    topConfidence: summary.topConfidence,
+    avgConfidence: summary.avgConfidence,
+    topConfirmedCount: summary.topConfirmedCount,
+    avgConfirmedCount: summary.avgConfirmedCount,
     sessions: summary.sessions,
     turnIndexes: summary.turnIndexes,
   });
@@ -171,12 +200,88 @@ function cosineSimilarityVectors(a = [], b = []) {
   return dot / (Math.sqrt(n1) * Math.sqrt(n2));
 }
 
+function dedupeFactMemoryHits(hits = [], similarityThreshold = 0.96) {
+  const source = Array.isArray(hits) ? hits : [];
+  if (!source.length) return [];
+
+  const unique = [];
+
+  for (let i = 0; i < source.length; i += 1) {
+    const candidate = source[i];
+    const candidateText = String(candidate?.factText || candidate?.text || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    const candidateVec = Array.isArray(candidate?.source?.embedding)
+      ? candidate.source.embedding
+      : [];
+
+    if (!candidateText && !candidateVec.length) continue;
+
+    const duplicate = unique.some((kept) => {
+      const keptText = String(kept?.factText || kept?.text || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+      const keptVec = Array.isArray(kept?.source?.embedding)
+        ? kept.source.embedding
+        : [];
+
+      if (candidateText && keptText && candidateText === keptText) return true;
+
+      if (
+        candidateVec.length &&
+        keptVec.length &&
+        candidateVec.length === keptVec.length &&
+        cosineSimilarityVectors(candidateVec, keptVec) >= similarityThreshold
+      ) {
+        return true;
+      }
+
+      return false;
+    });
+
+    if (!duplicate) unique.push(candidate);
+  }
+
+  return unique;
+}
+
+function parseMemoryControlDirectives(input = "") {
+  const raw = String(input || "").trim();
+  const normalized = raw.toLowerCase().replace(/\s+/g, " ");
+
+  const ignoreMemory = /\b(ignore memory|dont use memory|don't use memory|do not use memory|without memory|no memory)\b/.test(
+    normalized,
+  );
+
+  let forgetQuery = null;
+  const forgetMatch =
+    raw.match(/\bforget(?:\s+memory)?(?:\s+about)?\s*[:\-]?\s*(.+)$/i) ||
+    raw.match(/\bremove(?:\s+memory)?(?:\s+about)?\s*[:\-]?\s*(.+)$/i);
+
+  if (forgetMatch && forgetMatch[1]) {
+    const candidate = String(forgetMatch[1] || "")
+      .replace(/[.?!]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (
+      candidate &&
+      !/^(this|that|it|memory|memories)$/i.test(candidate)
+    ) {
+      forgetQuery = candidate;
+    }
+  }
+
+  return { ignoreMemory, forgetQuery };
+}
+
 async function extractMajorUserFactsWithLlm({
   userText = "",
   selectedLlmProvider = null,
   tenantId = "tenant-dev",
   userId = "user-001",
-  agentId = "agent-main",
   sessionId = "default",
 } = {}) {
   const text = String(userText || "").trim();
@@ -193,7 +298,7 @@ async function extractMajorUserFactsWithLlm({
   const payload = {
     tenantId,
     userId,
-    agentId,
+    agentId: CHAT_RUNTIME_AGENT_ID,
     sessionId,
     model: String(selectedLlmProvider?.model || CONTEXT.model || "").trim() || CONTEXT.model,
     stream: false,
@@ -232,7 +337,7 @@ async function extractMajorUserFactsWithLlm({
           "content-type": "application/json",
           "x-tenant-id": tenantId,
           "x-user-id": userId,
-          "x-agent-id": agentId,
+          "x-agent-id": CHAT_RUNTIME_AGENT_ID,
         },
       },
     );
@@ -360,18 +465,40 @@ export default function useChatSession() {
   const [messages, setMessages] = useState([]);
   const [telemetry, setTelemetry] = useState(emptyTelemetry());
   const [inspectorItems, setInspectorItems] = useState([]);
-  const [storageReady, setStorageReady] = useState(false);
-  const [isHydrated, setIsHydrated] = useState(false);
   const [toolsReady, setToolsReady] = useState(false);
 
-  // A2A delegation state
-  const [delegations, setDelegations] = useState([]);
-  const [a2aEnabled, setA2aEnabled] = useState(false);
+  const {
+    delegations,
+    a2aEnabled,
+    a2aBackendDefaults,
+    initializeA2A,
+    setA2aEnabledPreference,
+    setA2aConfigDefaultsPreference,
+    refreshDelegations,
+    delegateTask,
+  } = useA2ADelegation({ setStatus });
+
+  const {
+    storageReady,
+    isHydrated,
+    clearCurrentSession: clearSessionSnapshot,
+  } = useSessionStorageSync({
+    messages,
+    telemetry,
+    setMessages,
+    setTelemetry,
+    setStatus,
+    sanitizeMessage,
+    normalizeMessages,
+    emptySnapshot,
+    emptyTelemetry,
+  });
 
   const listRef = useRef(null);
-  const persistTimerRef = useRef(null);
-  const swipeRef = useRef({ x: 0, y: 0 });
-  const spaceToggleIntentRef = useRef(false);
+  const activeDelegationWatchersRef = useRef(new Map());
+  const lastSeenDelegationStatusRef = useRef(new Map());
+  const postedDelegationNotesRef = useRef(new Map());
+  const [activeDelegationWatchCount, setActiveDelegationWatchCount] = useState(0);
 
   const pagination = useMemo(
     () => derivePagination(messages, pageIndex, pageSize),
@@ -380,178 +507,99 @@ export default function useChatSession() {
 
   const { pages, lastPageIndex, safePageIndex, currentPage, isOnLastPage } = pagination;
   const telemetryText = useMemo(() => buildTelemetryText(telemetry), [telemetry]);
-  const composerDisabled = !storageReady || !isHydrated || !toolsReady;
-  const selectedLlmProvider = useMemo(() => {
-    const providers = Array.isArray(llmProviders) ? llmProviders : [];
-    if (!providers.length) return null;
-    return (
-      providers.find(
-        (provider) => String(provider?.id || "") === String(activeLlmProviderId || ""),
-      ) ||
-      activeLlmProvider ||
-      providers[0]
-    );
-  }, [activeLlmProvider, activeLlmProviderId, llmProviders]);
+  const composerDisabled = !storageReady || !isHydrated || !toolsReady || isLoading;
 
-  const navigate = useCallback(
-    (nextRoute) => {
-      if (nextRoute === route) return;
-      history.pushState({}, "", nextRoute);
-      setRoute(nextRoute);
-    },
-    [route, setRoute],
-  );
+  const {
+    selectedLlmProvider,
+    initializeLlmProviders,
+    updateActiveLlmProvider,
+    addLlmProvider,
+    removeLlmProvider,
+    saveLlmSettings,
+  } = useLlmProviderSettings({
+    llmProviders,
+    setLlmProviders,
+    activeLlmProviderId,
+    setActiveLlmProviderId,
+    activeLlmProvider,
+    setStatus,
+  });
 
-  const goPrevPage = useCallback(() => {
-    setPageIndex(clamp(safePageIndex - 1, 0, lastPageIndex));
-  }, [safePageIndex, lastPageIndex, setPageIndex]);
+  const {
+    navigate,
+    goPrevPage,
+    goNextPage,
+    focusComposer,
+    toggleFocusedMessageDetails,
+    copyFocusedMessage,
+    onTouchStart,
+    onTouchEnd,
+  } = useChatNavigation({
+    route,
+    setRoute,
+    safePageIndex,
+    lastPageIndex,
+    setPageIndex,
+    focusedMessageIndex,
+    currentPage,
+    listRef,
+  });
 
-  const goNextPage = useCallback(() => {
-    setPageIndex(clamp(safePageIndex + 1, 0, lastPageIndex));
-  }, [safePageIndex, lastPageIndex, setPageIndex]);
+  const trackDelegationWatcher = useCallback((delegationId, meta = {}) => {
+    const id = String(delegationId || "").trim();
+    if (!id) return;
 
-  const updateActiveLlmProvider = useCallback(
-    (patch = {}) => {
-      const targetId = String(
-        activeLlmProviderId ||
-          (Array.isArray(llmProviders) && llmProviders.length ? llmProviders[0]?.id : ""),
-      );
-
-      setLlmProviders((prev) => {
-        const list = Array.isArray(prev) ? prev : [];
-        return list.map((provider) =>
-          String(provider?.id || "") === targetId ? { ...provider, ...patch } : provider,
-        );
-      });
-    },
-    [activeLlmProviderId, llmProviders, setLlmProviders],
-  );
-
-  const addLlmProvider = useCallback(() => {
-    const providerId = `provider-${Date.now()}`;
-    const nextProvider = {
-      id: providerId,
-      name: `provider-${(Array.isArray(llmProviders) ? llmProviders.length : 0) + 1}`,
-      provider: "openai-compatible",
-      baseUrl: "",
-      model: String(CONTEXT.model || "nemotron-30b"),
-      contextWindowTokens: Number(CONTEXT.contextWindowTokens || 64_000),
-      tokenBudget: 0,
-      tokenSecret: "",
-    };
-
-    setLlmProviders((prev) => [...(Array.isArray(prev) ? prev : []), nextProvider]);
-    setActiveLlmProviderId(providerId);
-  }, [llmProviders, setActiveLlmProviderId, setLlmProviders]);
-
-  const removeLlmProvider = useCallback(
-    (providerId) => {
-      const list = Array.isArray(llmProviders) ? llmProviders : [];
-      if (list.length <= 1) return;
-
-      const targetId = String(providerId || activeLlmProviderId || "");
-      const filtered = list.filter((provider) => String(provider?.id || "") !== targetId);
-      if (!filtered.length) return;
-
-      setLlmProviders(filtered);
-      if (String(activeLlmProviderId || "") === targetId) {
-        setActiveLlmProviderId(String(filtered[0]?.id || ""));
-      }
-    },
-    [activeLlmProviderId, llmProviders, setActiveLlmProviderId, setLlmProviders],
-  );
-
-  const saveLlmSettings = useCallback(async () => {
-    try {
-      await writePersistedLlmProviderSettings({
-        providers: llmProviders,
-        activeProviderId: activeLlmProviderId,
-      });
-      setStatus("settings: saved");
-    } catch (err) {
-      setStatus(
-        `settings: save failed · ${err instanceof Error ? err.message : "unknown error"}`,
-      );
-    }
-  }, [activeLlmProviderId, llmProviders, setStatus]);
-
-  const focusComposer = useCallback(() => {
-    const el = document.querySelector('textarea[aria-label="New message"]');
-    el?.focus();
-  }, []);
-
-  const toggleFocusedMessageDetails = useCallback(() => {
-    if (!spaceToggleIntentRef.current) return false;
-    if (focusedMessageIndex < 0) return false;
-    const root = listRef.current;
-    if (!root) return false;
-
-    const cards = root.querySelectorAll("article");
-    const card = cards?.[focusedMessageIndex];
-    if (!card) return false;
-
-    const details = card.querySelectorAll("details");
-    if (!details.length) return false;
-
-    const shouldOpenAll = Array.from(details).some((node) => !node.open);
-    details.forEach((node) => {
-      node.open = shouldOpenAll;
+    activeDelegationWatchersRef.current.set(id, {
+      createdAt: Date.now(),
+      ...meta,
     });
-    return true;
-  }, [focusedMessageIndex]);
-
-  const copyFocusedMessage = useCallback(async () => {
-    if (focusedMessageIndex < 0) return false;
-    const msg = currentPage?.[focusedMessageIndex];
-    const text = typeof msg?.content === "string" ? msg.content : "";
-    if (!text || !navigator?.clipboard?.writeText) return false;
-    await navigator.clipboard.writeText(text);
-    return true;
-  }, [currentPage, focusedMessageIndex]);
-
-  const onTouchStart = useCallback((e) => {
-    const t = e.touches[0];
-    swipeRef.current = { x: t.clientX, y: t.clientY };
+    setActiveDelegationWatchCount(activeDelegationWatchersRef.current.size);
   }, []);
 
-  const onTouchEnd = useCallback(
-    (e) => {
-      const t = e.changedTouches[0];
-      const dx = t.clientX - swipeRef.current.x;
-      const dy = t.clientY - swipeRef.current.y;
-      if (Math.abs(dx) < 48 || Math.abs(dx) < Math.abs(dy)) return;
-      if (dx > 0) goPrevPage();
-      else goNextPage();
-    },
-    [goNextPage, goPrevPage],
-  );
+  const noteDelegationStatus = useCallback((delegationId, status) => {
+    const id = String(delegationId || "").trim();
+    if (!id) return;
 
-  useEffect(() => {
-    const onKeyDown = (event) => {
-      if (route !== ROUTES.CHAT) return;
-      if (event.defaultPrevented) return;
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.key !== " ") return;
+    const normalized = String(status || "").trim().toLowerCase();
+    if (!normalized) return;
 
-      const target = event.target;
-      const tag = target?.tagName?.toLowerCase?.() || "";
-      const editable = target?.isContentEditable || tag === "input" || tag === "textarea" || tag === "select";
-      if (editable) return;
+    lastSeenDelegationStatusRef.current.set(id, normalized);
+  }, []);
 
-      event.preventDefault();
-      spaceToggleIntentRef.current = true;
-      try {
-        void toggleFocusedMessageDetails();
-      } finally {
-        spaceToggleIntentRef.current = false;
-      }
-    };
+  const appendDelegationLifecycleNote = useCallback((delegation, status) => {
+    const delegationId = String(delegation?.delegationId || "").trim();
+    const normalizedStatus = String(status || "").trim().toLowerCase();
+    if (!delegationId || !normalizedStatus) return;
 
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [route, toggleFocusedMessageDetails]);
+    const target = String(delegation?.targetAgent || "");
+    const from = String(delegation?.fromAgent || "");
+    const resultText = String(delegation?.result?.content || "").trim();
+    const noteKey =
+      normalizedStatus === "done" && resultText
+        ? `${delegationId}:${normalizedStatus}:with-result`
+        : `${delegationId}:${normalizedStatus}`;
+    if (postedDelegationNotesRef.current.get(noteKey)) return;
+    postedDelegationNotesRef.current.set(noteKey, true);
+    const errorText = String(delegation?.error || "").trim();
+
+    let content = `[a2a] ${normalizedStatus} · ${delegationId.slice(0, 8)}… (${from} → ${target})`;
+    if (normalizedStatus === "done" && resultText) {
+      content += `\n\n${resultText}`;
+    } else if ((normalizedStatus === "failed" || normalizedStatus === "timeout") && errorText) {
+      content += `\n\n${errorText}`;
+    }
+
+    setMessages((prev) =>
+      normalizeMessages([
+        ...prev,
+        sanitizeMessage({
+          role: "assistant",
+          content,
+          timestamp: new Date().toISOString(),
+        }),
+      ]),
+    );
+  }, [setMessages]);
 
   useEffect(() => {
     let active = true;
@@ -561,14 +609,8 @@ export default function useChatSession() {
         await loadFrontendToolDefinitionsFromOpfs({ persistFallback: true });
         await createAndRegisterSkill({ name: "sw_unified_knowledge_runtime" });
 
-        const persisted = await readPersistedLlmProviderSettings();
-        const persistedProviders = Array.isArray(persisted?.providers) ? persisted.providers : [];
-        if (active && persistedProviders.length) {
-          setLlmProviders(persistedProviders);
-          setActiveLlmProviderId(
-            String(persisted?.activeProviderId || persistedProviders[0]?.id || ""),
-          );
-        }
+        await initializeLlmProviders();
+        await initializeA2A();
       } finally {
         if (active) setToolsReady(true);
       }
@@ -577,9 +619,14 @@ export default function useChatSession() {
     return () => {
       active = false;
     };
-  }, [setActiveLlmProviderId, setLlmProviders]);
+  }, [initializeA2A, initializeLlmProviders]);
 
   const send = useCallback(async (inputText = null) => {
+    if (isLoading) {
+      setStatus("agent: request already in progress");
+      return;
+    }
+
     if (!storageReady || !isHydrated) {
       setStatus("storage: OPFS not ready");
       return;
@@ -593,6 +640,10 @@ export default function useChatSession() {
     const resolvedInput = typeof inputText === "string" ? inputText : prompt;
     const text = resolvedInput.trim();
     if (!text) return;
+
+    const memoryControl = parseMemoryControlDirectives(text);
+    const ignoreMemoryThisTurn = Boolean(memoryControl?.ignoreMemory);
+    const forgetMemoryQuery = String(memoryControl?.forgetQuery || "").trim();
 
     const userMsg = makeUserMessage(text);
     const nextMessages = normalizeMessages([...messages, userMsg]);
@@ -610,9 +661,34 @@ export default function useChatSession() {
       nextMessages.filter((m) => String(m?.role || "") === "user").length - 1,
     );
     let memoryQueued = false;
-    try {
-      memoryQueued = true;
+    let forgotFactsDeleted = 0;
+    if (forgetMemoryQuery) {
+      try {
+        const forgetResult = await forgetConversationFactsByText({
+          tenantId: CONTEXT.tenantId,
+          userId: CONTEXT.userId,
+          agentId: CHAT_RUNTIME_AGENT_ID,
+          query: forgetMemoryQuery,
+        });
+        forgotFactsDeleted = Math.max(0, Number(forgetResult?.deleted || 0));
+        console.info("[memory:facts] forget", {
+          query: forgetMemoryQuery,
+          deleted: forgotFactsDeleted,
+        });
+      } catch (forgetErr) {
+        console.warn(
+          "[memory:facts] forget failed",
+          forgetErr instanceof Error ? forgetErr.message : "unknown error",
+          { query: forgetMemoryQuery },
+        );
+      }
+    }
 
+    const shouldSkipBackgroundMemory = ignoreMemoryThisTurn || Boolean(forgetMemoryQuery);
+    try {
+      memoryQueued = !shouldSkipBackgroundMemory;
+
+      if (!shouldSkipBackgroundMemory) {
       void (async () => {
         const startedAt =
           typeof performance !== "undefined" && typeof performance.now === "function"
@@ -631,7 +707,6 @@ export default function useChatSession() {
             selectedLlmProvider,
             tenantId: CONTEXT.tenantId,
             userId: CONTEXT.userId,
-            agentId: CONTEXT.agentId,
             sessionId: CONTEXT.sessionId,
           });
 
@@ -691,7 +766,7 @@ export default function useChatSession() {
           const existingFacts = await listConversationFactMemories({
             tenantId: CONTEXT.tenantId,
             userId: CONTEXT.userId,
-            agentId: CONTEXT.agentId,
+            agentId: CHAT_RUNTIME_AGENT_ID,
             sessionId: CONTEXT.sessionId,
             limit: 2000,
             offset: 0,
@@ -734,7 +809,7 @@ export default function useChatSession() {
           await writeConversationFactMemories({
             tenantId: CONTEXT.tenantId,
             userId: CONTEXT.userId,
-            agentId: CONTEXT.agentId,
+            agentId: CHAT_RUNTIME_AGENT_ID,
             sessionId: CONTEXT.sessionId,
             turnIndex,
             embeddingModel: MEMORY_EMBED_MODEL,
@@ -766,6 +841,7 @@ export default function useChatSession() {
           );
         }
       })();
+      }
     } catch (err) {
       console.warn(
         "[memory:facts] queue failed",
@@ -816,6 +892,7 @@ export default function useChatSession() {
 
           let memoryHits = [];
           let memoryRetrievalMs = 0;
+          if (!ignoreMemoryThisTurn) {
           try {
             const t0 =
               typeof performance !== "undefined" && typeof performance.now === "function"
@@ -845,7 +922,7 @@ export default function useChatSession() {
             const knn = await searchConversationMemoryKnn({
               tenantId: CONTEXT.tenantId,
               userId: CONTEXT.userId,
-              agentId: CONTEXT.agentId,
+              agentId: CHAT_RUNTIME_AGENT_ID,
               sessionId: CONTEXT.sessionId,
               excludeSessionId: CONTEXT.sessionId,
               excludeTurnIndexes,
@@ -871,15 +948,30 @@ export default function useChatSession() {
               topScore - MEMORY_SCORE_MARGIN_FROM_TOP,
             );
 
-            memoryHits = rawHits
-              .filter((item) => Number(item?.score || 0) >= adaptiveMinScore)
-              .slice(0, MEMORY_MAX_PROMPT_HITS);
+            const scoredHits = rawHits.filter(
+              (item) => Number(item?.score || 0) >= adaptiveMinScore,
+            );
+            const dedupedHits = dedupeFactMemoryHits(scoredHits, 0.96);
+            const forgetNeedle = forgetMemoryQuery.toLowerCase();
+            const filteredHits = forgetNeedle
+              ? dedupedHits.filter((item) => {
+                  const factText = String(item?.factText || item?.text || "")
+                    .replace(/\s+/g, " ")
+                    .toLowerCase();
+                  return !factText.includes(forgetNeedle);
+                })
+              : dedupedHits;
+
+            memoryHits = filteredHits.slice(0, MEMORY_MAX_PROMPT_HITS);
 
             promptMemoriesForAssistant = memoryHits;
             promptMemoryMetaForAssistant = {
               minScore: adaptiveMinScore,
               topK: MEMORY_KNN_TOP_K,
               retrievalMs: memoryRetrievalMs,
+              candidateCount: Number(knn?.totalCandidates || 0),
+              rawHitCount: rawHits.length,
+              dedupedHitCount: dedupedHits.length,
               hitCount: memoryHits.length,
             };
 
@@ -889,12 +981,19 @@ export default function useChatSession() {
               minScore: adaptiveMinScore,
               topK: MEMORY_KNN_TOP_K,
               durationMs: memoryRetrievalMs,
+              candidateCount: Number(knn?.totalCandidates || 0),
+              rawHitCount: rawHits.length,
+              dedupedHitCount: dedupedHits.length,
+              injectedCount: memoryHits.length,
             });
           } catch (err) {
             console.warn(
               "[memory:knn] retrieval failed",
               err instanceof Error ? err.message : "unknown error",
             );
+          }
+          } else {
+            console.info("[memory:knn] retrieval skipped (ignore-memory directive)");
           }
 
           const memoryPromptBlock = buildConversationMemoryPromptBlock(memoryHits);
@@ -922,7 +1021,6 @@ export default function useChatSession() {
             currentMessage,
             tenantId: CONTEXT.tenantId,
             userId: CONTEXT.userId,
-            agentId: CONTEXT.agentId,
             sessionId: CONTEXT.sessionId,
             route,
             page: route === ROUTES.STORAGE ? "storage" : "chat",
@@ -962,7 +1060,10 @@ export default function useChatSession() {
         });
 
         const payload = {
-          ...CONTEXT,
+          tenantId: CONTEXT.tenantId,
+          userId: CONTEXT.userId,
+          agentId: CHAT_RUNTIME_AGENT_ID,
+          sessionId: CONTEXT.sessionId,
           model: effectiveModel,
           stream: false,
           messages: requestMessagesWindowed,
@@ -1047,7 +1148,7 @@ export default function useChatSession() {
               "content-type": "application/json",
               "x-tenant-id": CONTEXT.tenantId,
               "x-user-id": CONTEXT.userId,
-              "x-agent-id": CONTEXT.agentId,
+              "x-agent-id": CHAT_RUNTIME_AGENT_ID,
             },
             onEvent: (evt) => {
               const payloadJson =
@@ -1166,19 +1267,53 @@ export default function useChatSession() {
           break;
         }
 
-        const toolResults = await executeFrontendToolCalls(
-          assistantWithTools.tool_calls,
-          {
-            tenantId: CONTEXT.tenantId,
-            userId: CONTEXT.userId,
-            agentId: CONTEXT.agentId,
-            sessionId: CONTEXT.sessionId,
-          },
-        );
+        let resolvedToolResults = [];
+        try {
+          const toolResults = await executeFrontendToolCalls(
+            assistantWithTools.tool_calls,
+            {
+              tenantId: CONTEXT.tenantId,
+              userId: CONTEXT.userId,
+              agentId: CHAT_RUNTIME_AGENT_ID,
+              sessionId: CONTEXT.sessionId,
+            },
+          );
+          resolvedToolResults = toolResults;
+        } catch (toolErr) {
+          const toolErrorText =
+            toolErr instanceof Error ? toolErr.message : "tool execution failed";
+          const isOpfsNotFound = /requested file or directory could not be found|notfounderror|could not be found at the time an operation was processed/i
+            .test(String(toolErrorText || ""));
+          if (isOpfsNotFound) {
+            setStatus("agent: ready · opfs file missing (continuing)");
+            resolvedToolResults = [];
+          } else {
+            throw toolErr;
+          }
+        }
 
-        executedTools += toolResults.length;
+        resolvedToolResults.forEach((result) => {
+          if (!result?.ok) return;
 
-        const toolMessages = toolResults
+          const toolName = String(result?.name || "").trim();
+          const payload = result?.result && typeof result.result === "object" ? result.result : null;
+          const delegationId = String(payload?.delegationId || "").trim();
+          if (!delegationId) return;
+
+          if (toolName === "delegate_task") {
+            trackDelegationWatcher(delegationId, {
+              source: "chat.send",
+              round,
+            });
+            noteDelegationStatus(delegationId, String(payload?.status || "dispatched"));
+          } else if (toolName === "get_delegation_status") {
+            noteDelegationStatus(delegationId, String(payload?.status || ""));
+          }
+        });
+
+        executedTools += resolvedToolResults.length;
+
+        const toolMessages = resolvedToolResults
           .map((result) => toFrontendToolMessage(result))
           .map((m) => sanitizeMessage(m));
 
@@ -1225,19 +1360,38 @@ export default function useChatSession() {
       const compactPart = compaction?.triggered ? ` · compacted ${compaction?.droppedMessages ?? 0}` : "";
       const toolPart = executedTools > 0 ? ` · tools ${executedTools}` : "";
       const memoryPart = memoryQueued ? " · memory queued" : "";
-      setStatus(`agent: ready · ${modelName}${tokenPart}${compactPart}${toolPart}${memoryPart}`);
+      const forgetPart = forgetMemoryQuery
+        ? ` · forgot ${forgotFactsDeleted} fact${forgotFactsDeleted === 1 ? "" : "s"}`
+        : "";
+      setStatus(
+        `agent: ready · ${modelName}${tokenPart}${compactPart}${toolPart}${memoryPart}${forgetPart}`,
+      );
     } catch (err) {
-      setMessages((prev) => [
-        ...prev.filter((m) => {
-          const ts = String(m?.timestamp || "");
-          return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
-        }),
-        sanitizeMessage({
-          role: "assistant",
-          content: `Error: ${err instanceof Error ? err.message : "unknown error"}`,
-        }),
-      ]);
-      setStatus("error");
+      const errorText = err instanceof Error ? err.message : "unknown error";
+      const isOpfsNotFound = /requested file or directory could not be found|notfounderror|could not be found at the time an operation was processed/i
+        .test(String(errorText || ""));
+
+      if (isOpfsNotFound) {
+        setMessages((prev) =>
+          prev.filter((m) => {
+            const ts = String(m?.timestamp || "");
+            return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
+          }),
+        );
+        setStatus("agent: ready · opfs file missing (non-fatal)");
+      } else {
+        setMessages((prev) => [
+          ...prev.filter((m) => {
+            const ts = String(m?.timestamp || "");
+            return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
+          }),
+          sanitizeMessage({
+            role: "assistant",
+            content: `Error: ${errorText}`,
+          }),
+        ]);
+        setStatus("error");
+      }
     } finally {
       setIsLoading(false);
     }
@@ -1245,6 +1399,7 @@ export default function useChatSession() {
     storageReady,
     isHydrated,
     toolsReady,
+    isLoading,
     prompt,
     messages,
     route,
@@ -1343,23 +1498,18 @@ export default function useChatSession() {
 
   const clearCurrentSession = useCallback(async () => {
     setInspectorStatus("clearing session...");
-    try {
-      await clearSnapshotFromOpfs(SNAPSHOT_FILE_NAME);
-      setMessages([]);
-      setTelemetry(emptyTelemetry());
-      resetInspectorSelection();
-      setInspectorStatus("session cleared");
-      await refreshInspector();
-    } catch (err) {
-      setInspectorStatus(`error · ${err instanceof Error ? err.message : "failed to clear session"}`);
-    }
-  }, [refreshInspector, resetInspectorSelection, setInspectorStatus]);
+    await clearSessionSnapshot();
+    await clearA2ADelegationRecords({
+      tenantId: CONTEXT.tenantId,
+      userId: CONTEXT.userId,
+      agentId: CHAT_RUNTIME_AGENT_ID,
+    });
+    resetInspectorSelection();
+    setInspectorStatus("session cleared");
+    await refreshInspector();
+  }, [clearSessionSnapshot, refreshInspector, resetInspectorSelection, setInspectorStatus]);
 
-  useEffect(() => {
-    const onPopState = () => setRoute(normalizeRoute(window.location.pathname));
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, [setRoute]);
+
 
 
 
@@ -1367,54 +1517,7 @@ export default function useChatSession() {
     setPageIndex((prev) => clamp(prev, 0, lastPageIndex));
   }, [lastPageIndex, setPageIndex]);
 
-  useEffect(() => {
-    let active = true;
-    (async () => {
-      try {
-        const snapshot = await readSnapshotFromOpfs(SNAPSHOT_FILE_NAME, {
-          sanitizeMessage: (m) => sanitizeMessage(m),
-          emptySnapshot,
-        });
-        if (!active) return;
-        setMessages(normalizeMessages(snapshot.messages));
-        setTelemetry(snapshot.telemetry || emptyTelemetry());
-        setStorageReady(true);
-        setIsHydrated(true);
-        setStatus("storage: opfs ready");
-      } catch {
-        if (!active) return;
-        setStorageReady(false);
-        setIsHydrated(false);
-        setStatus("storage: opfs unavailable");
-      }
-    })();
 
-    return () => {
-      active = false;
-    };
-  }, [setStatus]);
-
-  useEffect(() => {
-    if (!storageReady || !isHydrated) return;
-    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-
-    persistTimerRef.current = setTimeout(async () => {
-      try {
-        await writeSnapshotToOpfs(SNAPSHOT_FILE_NAME, {
-          updatedAt: new Date().toISOString(),
-          telemetry,
-          messages: messages.map((m) => sanitizeMessage(m)),
-        });
-        setStatus((prev) => (prev.startsWith("error") ? prev : "storage: synced"));
-      } catch {
-        setStatus("error: failed to sync OPFS");
-      }
-    }, 150);
-
-    return () => {
-      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-    };
-  }, [isHydrated, messages, storageReady, telemetry, setStatus]);
 
 
   useEffect(() => {
@@ -1458,38 +1561,59 @@ export default function useChatSession() {
     };
   }, [setStatus]);
 
-  // A2A: probe health and load delegations
-  const refreshDelegations = useCallback(async () => {
-    try {
-      const healthRes = await fetch(normalizeRoute("/api/a2a/health"));
-      if (!healthRes.ok) { setA2aEnabled(false); return; }
-      const health = await healthRes.json();
-      setA2aEnabled(Boolean(health?.a2aEnabled));
-      if (!health?.a2aEnabled) return;
+  useEffect(() => {
+    const terminal = new Set(["done", "failed", "timeout"]);
 
-      const listRes = await fetch(normalizeRoute("/api/a2a/delegations?limit=100"));
-      if (!listRes.ok) return;
-      const data = await listRes.json();
-      const list = Array.isArray(data?.delegations) ? data.delegations : [];
-      setDelegations(list);
-    } catch (_) {
-      setA2aEnabled(false);
-    }
-  }, []);
+    for (const item of delegations) {
+      const delegationId = String(item?.delegationId || "").trim();
+      if (!delegationId) continue;
 
-  const delegateTask = useCallback(async ({ task, targetAgent, intent } = {}) => {
-    try {
-      const res = await fetch(normalizeRoute("/api/agent/delegate"), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ task, targetAgent: targetAgent || undefined, intent: intent || undefined }),
-      });
-      const data = await res.json();
-      if (!res.ok) return { error: data?.detail || "delegation failed" };
-      return data;
-    } catch (err) {
-      return { error: String(err) };
+      const watcher = activeDelegationWatchersRef.current.get(delegationId);
+      if (!watcher) continue;
+
+      const nextStatus = String(item?.status || "").trim().toLowerCase();
+      if (!nextStatus) continue;
+
+      const prevStatus = String(
+        lastSeenDelegationStatusRef.current.get(delegationId) || "",
+      ).trim().toLowerCase();
+
+      const hasDoneResultText =
+        nextStatus === "done" && String(item?.result?.content || "").trim().length > 0;
+      const shouldPostDoneResultNote =
+        hasDoneResultText &&
+        !postedDelegationNotesRef.current.get(`${delegationId}:done:with-result`);
+
+      if (prevStatus !== nextStatus || shouldPostDoneResultNote) {
+        appendDelegationLifecycleNote(item, nextStatus);
+      }
+
+      noteDelegationStatus(delegationId, nextStatus);
+
+      if (terminal.has(nextStatus)) {
+        activeDelegationWatchersRef.current.delete(delegationId);
+      }
     }
+
+    setActiveDelegationWatchCount(activeDelegationWatchersRef.current.size);
+  }, [appendDelegationLifecycleNote, delegations, noteDelegationStatus]);
+
+  useEffect(() => {
+    if (!activeDelegationWatchCount) return undefined;
+
+    refreshDelegations();
+    const timer = setInterval(() => {
+      refreshDelegations();
+    }, 2000);
+
+    return () => clearInterval(timer);
+  }, [activeDelegationWatchCount, refreshDelegations]);
+
+  useEffect(() => () => {
+    activeDelegationWatchersRef.current.clear();
+    lastSeenDelegationStatusRef.current.clear();
+    postedDelegationNotesRef.current.clear();
+    setActiveDelegationWatchCount(0);
   }, []);
 
   return {
@@ -1547,6 +1671,9 @@ export default function useChatSession() {
     // A2A
     delegations,
     a2aEnabled,
+    a2aBackendDefaults,
+    setA2aEnabledPreference,
+    setA2aConfigDefaultsPreference,
     refreshDelegations,
     delegateTask,
   };

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import asyncio
-import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 
 from ...core.config import Settings, get_settings
 
@@ -18,22 +23,20 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _sse_event(event: str, data: Any) -> str:
-    payload = json.dumps(data, ensure_ascii=False, default=str)
-    return f"event: {event}\ndata: {payload}\n\n"
-
-
-def _require_a2a_enabled(settings: Settings) -> None:
-    if not settings.a2a_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="A2A is disabled (set A2A_ENABLED=true to enable)",
-        )
+def _raise_deprecated_store_endpoint(endpoint: str) -> NoReturn:
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            f"{endpoint} is deprecated. Backend delegation storage was removed. "
+            "Delegation state must be read from frontend IndexedDB and push updates."
+        ),
+    )
 
 
 @router.post("/agent/delegate")
 async def agent_delegate(
     payload: dict[str, Any],
+    request: Request,
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     """
@@ -41,10 +44,7 @@ async def agent_delegate(
 
     Body: task (required), targetAgent (optional), intent (optional).
     Returns a dispatch receipt with delegationId and initial status.
-    Poll GET /a2a/delegations/{delegationId} for progress.
     """
-    _require_a2a_enabled(settings)
-
     from ...services.orchestrator import run_outbound_delegation
 
     task = payload.get("task")
@@ -60,9 +60,20 @@ async def agent_delegate(
     task_dict: dict[str, Any] = task if isinstance(task, dict) else {"text": str(task)}
     delegation_id = str(uuid4())
 
+    caller_agent_id = str(
+        payload.get("agentId")
+        or request.headers.get("x-agent-id")
+        or ""
+    ).strip()
+    if not caller_agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="agentId is required",
+        )
+
     return await run_outbound_delegation(
         delegation_id=delegation_id,
-        from_agent=str(settings.a2a_agent_id),
+        from_agent=caller_agent_id,
         target_agent=target_agent,
         task=task_dict,
         intent=intent,
@@ -72,15 +83,11 @@ async def agent_delegate(
 
 @router.get("/a2a/health")
 async def a2a_health(settings: Settings = Depends(get_settings)) -> dict[str, Any]:
-    _require_a2a_enabled(settings)
-
     from ...services.a2a_transport import get_transport
-    from ...services.delegation_store import get_delegation_store
     from ...services.discovery_client import get_discovery_client
 
     transport = get_transport()
     discovery = get_discovery_client()
-    store = get_delegation_store()
 
     return {
         "ok": True,
@@ -90,16 +97,179 @@ async def a2a_health(settings: Settings = Depends(get_settings)) -> dict[str, An
             "backend": settings.a2a_transport_backend,
             "connected": transport is not None,
             "natsUrl": settings.a2a_nats_url,
+            "streamName": settings.a2a_stream_name,
+            "subjectPrefix": settings.a2a_subject_prefix,
+            "consumerName": settings.a2a_consumer_name,
+            "inboundAgentPattern": settings.a2a_inbound_agent_pattern,
+            "maxDeliver": settings.a2a_max_deliver,
+            "ackWaitSeconds": settings.a2a_ack_wait_seconds,
         },
         "discovery": {
             "connected": discovery is not None,
             "baseUrl": settings.a2a_discovery_base_url,
         },
+        "auth": {
+            "requireAuth": settings.a2a_require_auth,
+            "clockSkewSeconds": settings.a2a_clock_skew_seconds,
+            "nonceTtlSeconds": settings.a2a_nonce_ttl_seconds,
+            "sharedSecretConfigured": bool(settings.a2a_shared_secret),
+        },
+        "execution": {
+            "timeoutSeconds": settings.a2a_execution_timeout_seconds,
+        },
         "store": {
-            "delegations": store.count(),
+            "delegations": None,
+            "deprecated": True,
         },
         "timestamp": _iso_now(),
     }
+
+
+@router.get("/a2a/discovery/candidates")
+async def list_discovery_candidates(
+    targetAgent: str | None = None,
+    intent: str | None = None,
+    capabilities: str | None = None,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    from ...services.discovery_client import get_discovery_client
+
+    if not settings.a2a_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A2A is disabled",
+        )
+
+    discovery = get_discovery_client()
+    if discovery is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Discovery client is not initialized",
+        )
+
+    target = str(targetAgent or "").strip() or None
+    hint = str(intent or "").strip() or None
+    cap_list = [
+        part.strip()
+        for part in str(capabilities or "").split(",")
+        if part.strip()
+    ] or None
+
+    candidates = await discovery.discover_candidates(
+        target_agent=target,
+        intent=hint,
+        capabilities=cap_list,
+    )
+
+    return {
+        "candidates": candidates,
+        "count": len(candidates),
+        "targetAgent": target,
+        "intent": hint,
+        "capabilities": cap_list or [],
+        "timestamp": _iso_now(),
+    }
+
+
+@router.get("/a2a/discovery/specialists")
+async def list_discovery_specialists(
+    targetAgent: str | None = None,
+    intent: str | None = None,
+    capabilities: str | None = None,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    from ...services.discovery_client import get_discovery_client
+
+    if not settings.a2a_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A2A is disabled",
+        )
+
+    discovery = get_discovery_client()
+    if discovery is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Discovery client is not initialized",
+        )
+
+    target = str(targetAgent or "").strip() or None
+    hint = str(intent or "").strip() or None
+    cap_list = [
+        part.strip()
+        for part in str(capabilities or "").split(",")
+        if part.strip()
+    ] or None
+
+    specialists = await discovery.list_registration_candidates(
+        target_agent=target,
+        intent=hint,
+        capabilities=cap_list,
+    )
+
+    return {
+        "specialists": specialists,
+        "count": len(specialists),
+        "targetAgent": target,
+        "intent": hint,
+        "capabilities": cap_list or [],
+        "timestamp": _iso_now(),
+    }
+
+
+@router.get("/a2a/ws/status")
+async def a2a_ws_status(settings: Settings = Depends(get_settings)) -> dict[str, Any]:
+    from ...services.a2a_ws import get_a2a_ws_hub
+
+    hub = get_a2a_ws_hub()
+    connections = await hub.list_connections()
+    return {
+        "ok": True,
+        "enabled": bool(settings.a2a_enabled),
+        "connections": connections,
+        "count": len(connections),
+        "timestamp": _iso_now(),
+    }
+
+
+@router.websocket("/a2a/ws")
+async def a2a_ws_endpoint(
+    websocket: WebSocket,
+    tenantId: str | None = None,
+    userId: str | None = None,
+    agentId: str | None = None,
+    sessionId: str | None = None,
+) -> None:
+    from ...services.a2a_ws import get_a2a_ws_hub
+
+    hub = get_a2a_ws_hub()
+    connection = await hub.connect(
+        websocket,
+        tenant_id=str(tenantId) if tenantId else None,
+        user_id=str(userId) if userId else None,
+        agent_id=str(agentId) if agentId else None,
+        session_id=str(sessionId) if sessionId else None,
+        accept=True,
+    )
+
+    await websocket.send_json(
+        {
+            "type": "a2a.ws.connected",
+            "connectionId": connection.connection_id,
+            "agentId": connection.agent_id,
+            "timestamp": _iso_now(),
+        }
+    )
+
+    try:
+        while True:
+            message = await websocket.receive_text()
+            if str(message).strip().lower() == "ping":
+                await websocket.send_json({"type": "pong", "timestamp": _iso_now()})
+    except WebSocketDisconnect:
+        await hub.remove(connection.connection_id)
+    except Exception:
+        await hub.remove(connection.connection_id)
 
 
 @router.get("/a2a/delegations/{delegation_id}/stream")
@@ -107,51 +277,9 @@ async def stream_delegation_status(
     delegation_id: str,
     poll_interval_ms: int = 500,
     settings: Settings = Depends(get_settings),
-) -> StreamingResponse:
-    """
-    SSE stream for live delegation status updates.
-
-    Emits an 'update' event on every status change, then 'done' on terminal state.
-    """
-    _require_a2a_enabled(settings)
-
-    from ...services.delegation_store import TERMINAL_STATUSES, get_delegation_store
-
-    interval = max(0.1, min(5.0, poll_interval_ms / 1000))
-
-    async def event_stream():
-        store = get_delegation_store()
-        last_status: str | None = None
-
-        if store.get(delegation_id) is None:
-            yield _sse_event("error", {"error": f"delegation {delegation_id!r} not found"})
-            return
-
-        while True:
-            record = store.get(delegation_id)
-            if record is None:
-                yield _sse_event("error", {"error": "delegation record disappeared"})
-                return
-
-            if record.status != last_status:
-                last_status = record.status
-                yield _sse_event("update", record.to_dict())
-
-            if record.status in TERMINAL_STATUSES:
-                yield _sse_event("done", record.to_dict())
-                return
-
-            await asyncio.sleep(interval)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+) -> dict[str, Any]:
+    _ = delegation_id, poll_interval_ms, settings
+    _raise_deprecated_store_endpoint("/api/a2a/delegations/{delegation_id}/stream")
 
 
 @router.get("/a2a/delegations/{delegation_id}")
@@ -159,17 +287,8 @@ async def get_delegation(
     delegation_id: str,
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    _require_a2a_enabled(settings)
-
-    from ...services.delegation_store import get_delegation_store
-
-    record = get_delegation_store().get(delegation_id)
-    if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Delegation {delegation_id!r} not found",
-        )
-    return record.to_dict()
+    _ = delegation_id, settings
+    _raise_deprecated_store_endpoint("/api/a2a/delegations/{delegation_id}")
 
 
 @router.get("/a2a/delegations")
@@ -180,18 +299,5 @@ async def list_delegations(
     limit: int = 100,
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    _require_a2a_enabled(settings)
-
-    from ...services.delegation_store import get_delegation_store
-
-    records = get_delegation_store().list_records(
-        from_agent=fromAgent,
-        target_agent=targetAgent,
-        status=status_filter,
-        limit=max(1, min(500, limit)),
-    )
-    return {
-        "delegations": [r.to_dict() for r in records],
-        "count": len(records),
-        "timestamp": _iso_now(),
-    }
+    _ = fromAgent, targetAgent, status_filter, limit, settings
+    _raise_deprecated_store_endpoint("/api/a2a/delegations")

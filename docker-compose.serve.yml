@@ -1,4 +1,4 @@
-name: webagent-dev
+name: webagent-serve
 
 services:
   backend:
@@ -11,12 +11,11 @@ services:
       - ./.env
     environment:
       APP_NAME: webagent-backend
-      ENV: development
-      LOG_LEVEL: DEBUG
+      ENV: production
+      LOG_LEVEL: INFO
       HOST: 0.0.0.0
       PORT: 8000
       RELOAD: "false"
-      CORS_ORIGINS: '["http://localhost:5173"]'
       OPENAI_MODEL: ${OPENAI_MODEL:-nemotron-30b}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -24,40 +23,17 @@ services:
       A2A_ENABLED: "true"
       A2A_TRANSPORT_BACKEND: "nats"
       A2A_NATS_URL: "nats://10.0.20.52:4222"
-      A2A_CONSUMER_NAME: "webagent-local-debug"
-      A2A_INBOUND_AGENT_PATTERN: ">"
-      A2A_EXECUTION_TIMEOUT_SECONDS: "1800"
-      A2A_CLOCK_SKEW_SECONDS: "1800"
       A2A_DISCOVERY_BASE_URL: "http://a2a-discovery.sprit3dan-labs.net:8080"
       WEB_PUSH_ENABLED: ${WEB_PUSH_ENABLED:-false}
       WEB_PUSH_VAPID_PUBLIC_KEY: ${WEB_PUSH_VAPID_PUBLIC_KEY:-}
       WEB_PUSH_VAPID_PRIVATE_KEY: ${WEB_PUSH_VAPID_PRIVATE_KEY:-}
       WEB_PUSH_VAPID_SUBJECT: ${WEB_PUSH_VAPID_SUBJECT:-mailto:admin@example.com}
-      COMPACTION_TRIGGER_TOTAL_TOKENS: "64000"
-      COMPACTION_TARGET_TOTAL_TOKENS: "24000"
     volumes:
       - ./backend:/app/backend
+      - ./frontend/dist:/app/frontend/dist
       - backend_pip_cache:/root/.cache/pip
     ports:
-      - "8000:8000"
-
-  frontend:
-    image: node:20-alpine
-    working_dir: /app/frontend
-    command: >
-      sh -c "npm install &&
-             npm run dev -- --host 0.0.0.0 --port 5173"
-    environment:
-      VITE_BACKEND_URL: http://backend:8000
-      CHOKIDAR_USEPOLLING: "true"
-    volumes:
-      - ./frontend:/app/frontend
-      - frontend_node_modules:/app/frontend/node_modules
-    ports:
-      - "5173:5173"
-    depends_on:
-      - backend
+      - "8080:8000"
 
 volumes:
   backend_pip_cache:
-  frontend_node_modules:

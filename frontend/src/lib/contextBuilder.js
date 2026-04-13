@@ -18,23 +18,29 @@ const BOOTSTRAP_FILES = [
 ];
 
 export async function ensureContextBootstrapFilesInOpfs() {
-  return runtimeShared.ensureContextBootstrapFilesInOpfs(BOOTSTRAP_FILES);
+  try {
+    return await runtimeShared.ensureContextBootstrapFilesInOpfs(BOOTSTRAP_FILES);
+  } catch {
+    return false;
+  }
 }
 
 export async function loadContextBootstrapFromOpfs() {
-  return runtimeShared.loadContextBootstrapFromOpfs(BOOTSTRAP_FILES);
+  try {
+    return await runtimeShared.loadContextBootstrapFromOpfs(BOOTSTRAP_FILES);
+  } catch {
+    return { files: [], text: "" };
+  }
 }
 
 export function buildIdentitySection({
   tenantId = "tenant-dev",
   userId = "user-001",
-  agentId = "agent-main",
   sessionId = "chat-001",
 } = {}) {
   return runtimeShared.buildIdentitySection({
     tenantId,
     userId,
-    agentId,
     sessionId,
     environment: "browser",
   });
@@ -43,7 +49,6 @@ export function buildIdentitySection({
 export function buildRuntimeMetadataBlock({
   tenantId,
   userId,
-  agentId,
   sessionId,
   route = "/",
   page = "chat",
@@ -52,7 +57,6 @@ export function buildRuntimeMetadataBlock({
   return runtimeShared.buildRuntimeMetadataBlock({
     tenantId,
     userId,
-    agentId,
     sessionId,
     route,
     page,
@@ -85,7 +89,6 @@ export async function buildContextForLlm({
   currentMessage = "",
   tenantId = "tenant-dev",
   userId = "user-001",
-  agentId = "agent-main",
   sessionId = "chat-001",
   route = "/",
   page = "chat",
@@ -96,10 +99,13 @@ export async function buildContextForLlm({
   await ensureContextBootstrapFilesInOpfs();
 
   const bootstrap = await loadContextBootstrapFromOpfs();
-  const identity = buildIdentitySection({ tenantId, userId, agentId, sessionId });
+  const bootstrapText =
+    bootstrap && typeof bootstrap.text === "string" ? bootstrap.text : "";
+  const bootstrapFiles = Array.isArray(bootstrap?.files) ? bootstrap.files : [];
+  const identity = buildIdentitySection({ tenantId, userId, sessionId });
   const systemPrompt = buildSystemPrompt({
     identitySection: identity,
-    bootstrapText: bootstrap.text,
+    bootstrapText,
     memoryText,
     skillsText,
   });
@@ -107,7 +113,6 @@ export async function buildContextForLlm({
   const runtimeBlock = buildRuntimeMetadataBlock({
     tenantId,
     userId,
-    agentId,
     sessionId,
     route,
     page,
@@ -131,7 +136,7 @@ export async function buildContextForLlm({
   return {
     systemPrompt,
     runtimeBlock,
-    bootstrapFiles: bootstrap.files.map((f) => f.fileName),
+    bootstrapFiles: bootstrapFiles.map((f) => f.fileName),
     messages,
   };
 }

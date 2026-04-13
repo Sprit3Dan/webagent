@@ -64,6 +64,7 @@ def build_envelope(
     to_agent: str,
     delegation_id: str,
     payload: dict[str, Any],
+    content: str = "",
     secret: str | None = None,
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
@@ -72,6 +73,8 @@ def build_envelope(
 
     timestamp is a Unix integer (nanobot-compatible).
     auth field uses {"method": "hmac-sha256", "signature": "..."} structure.
+    content is a plain-text task string for nanobot compatibility
+    (nanobot's A2AChannel reads envelope["content"] to dispatch the task).
     correlation_id is optional; propagated end-to-end for observability.
     """
     envelope: dict[str, Any] = {
@@ -83,6 +86,7 @@ def build_envelope(
         "to_agent": to_agent,
         "timestamp": int(time.time()),
         "nonce": str(uuid4()),
+        "content": content,
         "payload": payload,
     }
     if correlation_id:
@@ -165,9 +169,13 @@ def validate_envelope(
     if envelope["protocol"] != PROTOCOL_VERSION:
         raise ValueError(f"Unknown protocol: {envelope['protocol']!r}")
 
-    # 3. Recipient — accept explicit match or wildcard
-    to_agent = envelope["to_agent"]
-    if to_agent != self_agent_id and to_agent != "*":
+    # 3. Recipient — accept explicit match, wildcard, or instance-suffixed match
+    # Example: self_agent_id="webagent" should accept "webagent-<instance-id>".
+    to_agent = str(envelope["to_agent"])
+    is_exact = to_agent == self_agent_id
+    is_wildcard = to_agent == "*"
+    is_instance_suffix = to_agent.startswith(f"{self_agent_id}-")
+    if not (is_exact or is_wildcard or is_instance_suffix):
         raise ValueError(f"Wrong recipient: expected {self_agent_id!r}, got {to_agent!r}")
 
     # 4. Clock skew — timestamp must be Unix integer seconds

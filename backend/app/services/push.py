@@ -320,3 +320,48 @@ async def send_web_push_to_registry(
         "failed": failed,
         "results": results,
     }
+
+
+async def publish_a2a_push_update(
+    *,
+    delegation_id: str,
+    status: str,
+    from_agent: str | None = None,
+    target_agent: str | None = None,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+    vapid_private_key: str,
+    vapid_subject: str,
+    ttl: int = 60,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "a2a.delegation.update",
+        "delegationId": _safe_str(delegation_id),
+        "status": _safe_str(status),
+        "fromAgent": _safe_str(from_agent) or None,
+        "targetAgent": _safe_str(target_agent) or None,
+        "result": result,
+        "error": _safe_str(error) or None,
+        "updatedAt": _iso_now(),
+    }
+
+    delivery = await send_web_push_to_registry(
+        payload,
+        vapid_private_key=vapid_private_key,
+        vapid_subject=vapid_subject,
+        ttl=ttl,
+        tenant_id=_safe_str(tenant_id) or None,
+        user_id=_safe_str(user_id) or None,
+        agent_id=_safe_str(agent_id) or None,
+        session_id=_safe_str(session_id) or None,
+    )
+
+    return {
+        "ok": bool(delivery.get("ok")),
+        "payload": payload,
+        "delivery": delivery,
+    }

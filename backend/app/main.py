@@ -17,10 +17,32 @@ from .services.tools import register_builtin_tools
 logger = logging.getLogger(__name__)
 
 
+def _a2a_event_summary(event: dict[str, Any]) -> dict[str, Any]:
+    payload_raw = event.get("payload")
+    payload = payload_raw if isinstance(payload_raw, dict) else {}
+    result = payload.get("result")
+    content = str(payload.get("content") or event.get("content") or "").strip()
+
+    return {
+        "delegation_id": str(event.get("delegation_id") or "").strip(),
+        "event_id": str(event.get("event_id") or "").strip(),
+        "message_id": str(event.get("message_id") or "").strip(),
+        "message_type": str(event.get("message_type") or "").strip().lower(),
+        "status": str(event.get("status") or "").strip().lower(),
+        "from_agent": str(event.get("from_agent") or "").strip(),
+        "to_agent": str(event.get("to_agent") or event.get("target_agent") or "").strip(),
+        "correlation_id": str(event.get("correlation_id") or "").strip(),
+        "payload_keys": sorted(payload.keys()),
+        "has_task": isinstance(payload.get("task"), dict),
+        "has_result_dict": isinstance(result, dict),
+        "result_type": type(result).__name__ if result is not None else "none",
+        "content_len": len(content),
+    }
+
+
 async def _a2a_startup(settings: Settings) -> None:
     from .services.a2a_protocol import validate_envelope
     from .services.a2a_transport import init_transport
-    from .services.delegation_store import get_delegation_store
     from .services.discovery_client import init_discovery_client
     from .services.orchestrator import run_inbound_delegation
 
@@ -48,8 +70,19 @@ async def _a2a_startup(settings: Settings) -> None:
         subject_prefix=settings.a2a_subject_prefix,
         self_agent_id=str(settings.a2a_agent_id),
         consumer_name=settings.a2a_consumer_name,
+        inbound_agent_pattern=settings.a2a_inbound_agent_pattern,
         max_deliver=settings.a2a_max_deliver,
         ack_wait_seconds=settings.a2a_ack_wait_seconds,
+    )
+    logger.info(
+        "a2a: transport config backend=%s nats_url=%s stream=%s prefix=%s agent_id=%s inbound_selector=%s consumer=%s",
+        settings.a2a_transport_backend,
+        settings.a2a_nats_url,
+        settings.a2a_stream_name,
+        settings.a2a_subject_prefix,
+        settings.a2a_agent_id,
+        settings.a2a_inbound_agent_pattern,
+        settings.a2a_consumer_name,
     )
 
     try:
@@ -61,9 +94,33 @@ async def _a2a_startup(settings: Settings) -> None:
     # Inbound delegation consumer handler
     async def _delegation_handler(envelope: dict[str, Any]) -> None:
         try:
+            configured_agent_id = str(settings.a2a_agent_id or "").strip()
+            validation_agent_id = configured_agent_id
+            if "-" in configured_agent_id:
+                base_agent_id = configured_agent_id.split("-", 1)[0].strip()
+                if base_agent_id:
+                    validation_agent_id = base_agent_id
+
+            to_agent = str(envelope.get("to_agent") or "").strip()
+            is_for_self = (
+                to_agent == configured_agent_id
+                or to_agent == "*"
+                or (
+                    bool(validation_agent_id)
+                    and to_agent.startswith(f"{validation_agent_id}-")
+                )
+            )
+            if not is_for_self:
+                logger.debug(
+                    "a2a: envelope ignored summary=%s self_agent_id=%s",
+                    _a2a_event_summary(envelope),
+                    configured_agent_id or "<missing>",
+                )
+                return
+
             validate_envelope(
                 envelope,
-                self_agent_id=str(settings.a2a_agent_id),
+                self_agent_id=validation_agent_id,
                 require_auth=settings.a2a_require_auth,
                 shared_secret=settings.a2a_shared_secret,
                 clock_skew_seconds=settings.a2a_clock_skew_seconds,
@@ -80,34 +137,237 @@ async def _a2a_startup(settings: Settings) -> None:
             except Exception:
                 pass
             return
-        await run_inbound_delegation(envelope, settings)
 
-    # Inbound status consumer handler — accepts nanobot flat format:
-    # {"event_id": ..., "delegation_id": ..., "status": ..., "from_agent": ..., "payload": {...}}
-    async def _status_handler(event: dict[str, Any]) -> None:
-        delegation_id = str(event.get("delegation_id") or "")
-        # event_id is nanobot's field; message_id is webagent's — accept both
-        message_id = str(event.get("event_id") or event.get("message_id") or "")
-        new_status = str(event.get("status") or "")
-        payload = event.get("payload") or {}
-        result = payload.get("result")
-        error = payload.get("error")
+        delegation_id = str(envelope.get("delegation_id") or "").strip()
+        from_agent = str(envelope.get("from_agent") or "").strip()
+        to_agent = str(envelope.get("to_agent") or "").strip()
+        message_type = str(envelope.get("message_type") or "").strip().lower()
+        payload_raw = envelope.get("payload")
+        payload = payload_raw if isinstance(payload_raw, dict) else {}
+        content = str(envelope.get("content") or "").strip()
 
-        if not delegation_id or not new_status:
-            logger.warning("a2a: status event missing delegation_id or status, skipping")
+        logger.debug(
+            "a2a: inbound envelope accepted summary=%s",
+            _a2a_event_summary(envelope),
+        )
+
+        task_payload = payload.get("task")
+        has_structured_task = isinstance(task_payload, dict)
+
+        # Structured delegation requests are executed locally.
+        # Terminal replies from peer agents may still use delegation_request
+        # but without payload.task, and should be pushed as done updates.
+        if message_type == "delegation_request" and has_structured_task:
+            await run_inbound_delegation(envelope, settings)
             return
 
-        store = get_delegation_store()
-        store.transition(
-            delegation_id, new_status,
-            message_id=message_id,
-            result=result,
-            error=error,
+        if not delegation_id:
+            logger.warning("a2a: reply envelope missing delegation_id, skipping push passthrough")
+            return
+
+        result_raw = payload.get("result")
+        payload_content = str(payload.get("content") or "").strip()
+        result_dict = (
+            result_raw
+            if isinstance(result_raw, dict)
+            else {"content": payload_content or content}
         )
-        logger.info(
-            "a2a: status update delegation_id=%s status=%s event_id=%s",
-            delegation_id, new_status, message_id,
+
+        target = to_agent or str(settings.a2a_agent_id or "")
+        ws_sent = 0
+
+        try:
+            from .services.a2a_ws import get_a2a_ws_hub
+
+            ws_result = await get_a2a_ws_hub().publish_a2a_update(
+                delegation_id=delegation_id,
+                status="done",
+                from_agent=from_agent,
+                target_agent=target,
+                result=result_dict,
+                error=None,
+                agent_id=target,
+            )
+            delivery = ws_result.get("delivery") if isinstance(ws_result, dict) else {}
+            ws_sent = int((delivery or {}).get("sent") or 0)
+            logger.debug(
+                "a2a: reply ws publish delegation_id=%s target_agent=%s sent=%s failed=%s",
+                delegation_id,
+                target,
+                ws_sent,
+                int((delivery or {}).get("failed") or 0),
+            )
+        except Exception as exc:
+            logger.warning(
+                "a2a: failed to publish ws update for reply delegation_id=%s: %s",
+                delegation_id,
+                exc,
+            )
+
+        if ws_sent > 0:
+            return
+
+        if (
+            settings.web_push_enabled
+            and settings.web_push_vapid_private_key
+            and settings.web_push_vapid_subject
+        ):
+            try:
+                from .services.push import publish_a2a_push_update
+
+                logger.debug(
+                    "a2a: reply push start summary=%s result_content_len=%s",
+                    _a2a_event_summary(envelope),
+                    len(str(result_dict.get("content") or "")),
+                )
+
+                push_result = await publish_a2a_push_update(
+                    delegation_id=delegation_id,
+                    status="done",
+                    from_agent=from_agent,
+                    target_agent=target,
+                    result=result_dict,
+                    error=None,
+                    agent_id=target,
+                    vapid_private_key=str(settings.web_push_vapid_private_key or ""),
+                    vapid_subject=str(settings.web_push_vapid_subject or ""),
+                    ttl=60,
+                )
+                delivery = push_result.get("delivery") if isinstance(push_result, dict) else {}
+
+                logger.debug(
+                    "a2a: reply push done delegation_id=%s target_agent=%s sent=%s failed=%s",
+                    delegation_id,
+                    target,
+                    int((delivery or {}).get("sent") or 0),
+                    int((delivery or {}).get("failed") or 0),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "a2a: failed to publish push passthrough for reply delegation_id=%s: %s",
+                    delegation_id, exc,
+                )
+
+    # Inbound status consumer handler — push-only passthrough.
+    async def _status_handler(event: dict[str, Any]) -> None:
+        delegation_id = str(event.get("delegation_id") or "").strip()
+        raw_status = str(event.get("status") or "").strip().lower()
+        new_status = "done" if raw_status == "completed" else raw_status
+        from_agent = str(event.get("from_agent") or "").strip()
+        to_agent = str(event.get("to_agent") or event.get("target_agent") or "").strip()
+        payload_raw = event.get("payload")
+        payload = payload_raw if isinstance(payload_raw, dict) else {}
+        result = payload.get("result")
+        error = payload.get("error")
+        content = str(payload.get("content") or event.get("content") or "").strip()
+
+        normalized_result: dict[str, Any] | None = None
+        if isinstance(result, dict):
+            normalized_result = result
+        elif isinstance(result, str) and result.strip():
+            normalized_result = {"content": result.strip()}
+        elif content:
+            normalized_result = {"content": content}
+
+        logger.debug(
+            "a2a: status received summary=%s normalized_status=%s",
+            _a2a_event_summary(event),
+            new_status,
         )
+
+        if not delegation_id or not new_status:
+            logger.warning("a2a: status passthrough missing delegation_id or status, skipping")
+            return
+
+        allowed_statuses = {"created", "dispatched", "received", "running", "done", "failed", "timeout"}
+        if new_status not in allowed_statuses:
+            logger.warning(
+                "a2a: status passthrough unknown status delegation_id=%s status=%s",
+                delegation_id, new_status,
+            )
+            return
+
+        target = to_agent or str(settings.a2a_agent_id or "")
+        ws_sent = 0
+
+        try:
+            from .services.a2a_ws import get_a2a_ws_hub
+
+            ws_result = await get_a2a_ws_hub().publish_a2a_update(
+                delegation_id=delegation_id,
+                status=new_status,
+                from_agent=from_agent,
+                target_agent=target,
+                result=normalized_result,
+                error=error if isinstance(error, str) else None,
+                agent_id=target,
+            )
+            delivery = ws_result.get("delivery") if isinstance(ws_result, dict) else {}
+            ws_sent = int((delivery or {}).get("sent") or 0)
+            logger.debug(
+                "a2a: status ws publish delegation_id=%s status=%s target=%s sent=%s failed=%s",
+                delegation_id,
+                new_status,
+                target,
+                ws_sent,
+                int((delivery or {}).get("failed") or 0),
+            )
+        except Exception as exc:
+            logger.warning(
+                "a2a: status ws publish failed delegation_id=%s status=%s: %s",
+                delegation_id,
+                new_status,
+                exc,
+            )
+
+        if ws_sent > 0:
+            return
+
+        if not (
+            settings.web_push_enabled
+            and settings.web_push_vapid_private_key
+            and settings.web_push_vapid_subject
+        ):
+            return
+
+        try:
+            from .services.push import publish_a2a_push_update
+
+            logger.debug(
+                "a2a: status push start delegation_id=%s status=%s target=%s has_result=%s result_content_len=%s has_error=%s",
+                delegation_id,
+                new_status,
+                target,
+                isinstance(normalized_result, dict),
+                len(str((normalized_result or {}).get("content") or "")) if isinstance(normalized_result, dict) else 0,
+                isinstance(error, str) and bool(error),
+            )
+            push_result = await publish_a2a_push_update(
+                delegation_id=delegation_id,
+                status=new_status,
+                from_agent=from_agent,
+                target_agent=target,
+                result=normalized_result,
+                error=error if isinstance(error, str) else None,
+                agent_id=target,
+                vapid_private_key=str(settings.web_push_vapid_private_key or ""),
+                vapid_subject=str(settings.web_push_vapid_subject or ""),
+                ttl=60,
+            )
+            delivery = push_result.get("delivery") if isinstance(push_result, dict) else {}
+            logger.debug(
+                "a2a: status push done delegation_id=%s status=%s target=%s sent=%s failed=%s",
+                delegation_id,
+                new_status,
+                target,
+                int((delivery or {}).get("sent") or 0),
+                int((delivery or {}).get("failed") or 0),
+            )
+        except Exception as exc:
+            logger.warning(
+                "a2a: status passthrough push failed delegation_id=%s status=%s: %s",
+                delegation_id, new_status, exc,
+            )
 
     await transport.start_consumers(
         delegation_handler=_delegation_handler,
@@ -129,32 +389,13 @@ async def _a2a_startup(settings: Settings) -> None:
 
     asyncio.create_task(_registration_refresh(), name="a2a-registration-refresh")
 
-    # Timeout watchdog: transitions stuck delegations to "timeout"
-    timeout_seconds = settings.a2a_execution_timeout_seconds
 
-    async def _timeout_watchdog() -> None:
-        from .services.delegation_store import TERMINAL_STATUSES
-        import time as _time
-        while True:
-            await asyncio.sleep(30)
-            try:
-                store = get_delegation_store()
-                now = _time.time()
-                for record in store.list_records(limit=10_000):
-                    if record.status in TERMINAL_STATUSES:
-                        continue
-                    age = now - record.created_at.timestamp()
-                    if age > timeout_seconds:
-                        store.transition(record.delegation_id, "timeout")
-                        logger.warning(
-                            "a2a: watchdog timed out delegation_id=%s age=%.0fs",
-                            record.delegation_id, age,
-                        )
-            except Exception as exc:
-                logger.error("a2a: timeout watchdog error: %s", exc)
-
-    asyncio.create_task(_timeout_watchdog(), name="a2a-timeout-watchdog")
-    logger.info("a2a: startup complete agent_id=%s", settings.a2a_agent_id)
+    logger.info(
+        "a2a: startup complete agent_id=%s inbound_selector=%s transport_backend=%s",
+        settings.a2a_agent_id,
+        settings.a2a_inbound_agent_pattern,
+        settings.a2a_transport_backend,
+    )
 
 
 async def _a2a_shutdown(settings: Settings) -> None:
@@ -183,13 +424,11 @@ async def lifespan(app: FastAPI):
 
     register_builtin_tools(include_if_exists=True)
 
-    if settings.a2a_enabled:
-        await _a2a_startup(settings)
+    await _a2a_startup(settings)
 
     yield
 
-    if settings.a2a_enabled:
-        await _a2a_shutdown(settings)
+    await _a2a_shutdown(settings)
 
 
 def create_app() -> FastAPI:

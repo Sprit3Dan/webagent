@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -47,6 +48,14 @@ def _safe_content(value: Any) -> str:
                     parts.append(text)
         return "\n".join(parts).strip()
     return str(value)
+
+
+_NATS_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_nats_safe_token(value: str) -> bool:
+    candidate = str(value or "").strip()
+    return bool(candidate and _NATS_TOKEN_RE.fullmatch(candidate))
 
 
 def _tool_call_to_dict(call: Any) -> dict[str, Any]:
@@ -280,7 +289,6 @@ async def run_inbound_delegation(
     """
     from .a2a_protocol import build_status_event
     from .a2a_transport import get_transport
-    from .delegation_store import get_delegation_store
 
     delegation_id = str(envelope.get("delegation_id") or "")
     message_id = str(envelope.get("message_id") or "")
@@ -289,16 +297,8 @@ async def run_inbound_delegation(
     payload = envelope.get("payload") or {}
     task = payload.get("task") or {}
 
-    store = get_delegation_store()
     transport = get_transport()
     self_agent_id = str(settings.a2a_agent_id or "")
-
-    store.create(
-        delegation_id=delegation_id,
-        target_agent=self_agent_id,
-        from_agent=from_agent,
-        task=task,
-    )
 
     async def _publish_status(
         new_status: str,
@@ -306,7 +306,12 @@ async def run_inbound_delegation(
         error: str | None = None,
     ) -> None:
         if transport is None:
+            logger.warning(
+                "run_inbound_delegation: status publish skipped (no transport) delegation_id=%s status=%s from=%s to=%s",
+                delegation_id, new_status, self_agent_id, from_agent,
+            )
             return
+
         event = build_status_event(
             delegation_id=delegation_id,
             status=new_status,
@@ -315,19 +320,45 @@ async def run_inbound_delegation(
             error=error,
             correlation_id=correlation_id,
         )
+
+        logger.info(
+            "run_inbound_delegation: publishing status delegation_id=%s status=%s from=%s to=%s event_id=%s has_result=%s has_error=%s correlation_id=%s",
+            delegation_id,
+            new_status,
+            self_agent_id,
+            from_agent,
+            str(event.get("event_id") or ""),
+            result is not None,
+            error is not None,
+            correlation_id or "",
+        )
+
         try:
             await transport.publish_status(from_agent, event)
+            logger.info(
+                "run_inbound_delegation: published status delegation_id=%s status=%s event_id=%s",
+                delegation_id,
+                new_status,
+                str(event.get("event_id") or ""),
+            )
         except Exception as exc:
             logger.error(
                 "run_inbound_delegation: failed to publish status delegation_id=%s status=%s: %s",
                 delegation_id, new_status, exc,
             )
 
+    logger.info(
+        "run_inbound_delegation: lifecycle transition start delegation_id=%s phase=received message_id=%s",
+        delegation_id,
+        message_id,
+    )
     await _publish_status("received")
-    store.transition(delegation_id, "received", message_id=message_id)
 
+    logger.info(
+        "run_inbound_delegation: lifecycle transition start delegation_id=%s phase=running",
+        delegation_id,
+    )
     await _publish_status("running")
-    store.transition(delegation_id, "running")
 
     try:
         task_messages = task.get("messages") or []
@@ -339,7 +370,11 @@ async def run_inbound_delegation(
         result_content = await _execute_task_messages(chat_messages, settings)
 
         result_dict = {"content": result_content}
-        store.transition(delegation_id, "done", result=result_dict)
+        logger.info(
+            "run_inbound_delegation: lifecycle transition start delegation_id=%s phase=done result_chars=%s",
+            delegation_id,
+            len(str(result_content or "")),
+        )
         await _publish_status("done", result=result_dict)
 
         logger.info(
@@ -350,7 +385,6 @@ async def run_inbound_delegation(
 
     except Exception as exc:
         error_str = str(exc)
-        store.transition(delegation_id, "failed", error=error_str)
         await _publish_status("failed", error=error_str)
         logger.error(
             "run_inbound_delegation: failed delegation_id=%s: %s",
@@ -402,12 +436,10 @@ async def run_outbound_delegation(
     """
     from .a2a_protocol import MSG_DELEGATE, build_envelope
     from .a2a_transport import get_transport
-    from .delegation_store import get_delegation_store
     from .discovery_client import get_discovery_client
     from uuid import uuid4 as _uuid4
     correlation_id = str(_uuid4())
 
-    store = get_delegation_store()
     transport = get_transport()
 
     if transport is None:
@@ -421,25 +453,38 @@ async def run_outbound_delegation(
     if not resolved_target:
         discovery = get_discovery_client()
         if discovery:
-            route = await discovery.discover_route(intent=intent)
+            discovery_intent = (intent or "").strip()
+            if not discovery_intent:
+                discovery_intent = str(
+                    task.get("text")
+                    or task.get("task")
+                    or ""
+                ).strip()
+            route = await discovery.discover_route(intent=discovery_intent or None)
             if route:
-                resolved_target = str(route.get("agentId") or "")
+                resolved_target = str(route.get("agent_id") or route.get("agentId") or "")
         if not resolved_target:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Could not resolve target agent via discovery",
             )
 
-    store.create(
-        delegation_id=delegation_id,
-        target_agent=resolved_target,
-        from_agent=from_agent,
-        task=task,
-    )
+    if not _is_nats_safe_token(resolved_target):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="targetAgent must be a NATS-safe token using only letters, digits, '-' or '_'",
+        )
 
     logger.info(
         "run_outbound_delegation: delegation_id=%s from=%s to=%s",
         delegation_id, from_agent, resolved_target,
+    )
+
+    # Extract plain text for nanobot's A2AChannel which reads envelope["content"]
+    task_content = (
+        task.get("text")
+        or task.get("task")
+        or (json.dumps(task) if task else "")
     )
 
     envelope = build_envelope(
@@ -448,6 +493,7 @@ async def run_outbound_delegation(
         to_agent=resolved_target,
         delegation_id=delegation_id,
         payload={"task": task, "intent": intent},
+        content=task_content,
         secret=settings.a2a_shared_secret if settings.a2a_require_auth else None,
         correlation_id=correlation_id,
     )
@@ -455,13 +501,10 @@ async def run_outbound_delegation(
     try:
         await transport.publish_delegation(resolved_target, envelope)
     except Exception as exc:
-        store.transition(delegation_id, "failed", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to publish delegation envelope: {exc}",
         ) from exc
-
-    store.transition(delegation_id, "dispatched")
 
     return {
         "delegationId": delegation_id,

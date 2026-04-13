@@ -28,6 +28,11 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
+      "/api/a2a/ws": {
+        target: backendTarget,
+        changeOrigin: true,
+        ws: true,
+      },
       "/api": {
         target: backendTarget,
         changeOrigin: true,

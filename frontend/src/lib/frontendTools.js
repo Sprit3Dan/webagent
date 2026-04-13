@@ -1,4 +1,6 @@
 import { createAndRegisterSkill } from "./skills";
+import { getOrCreateFrontendInstanceId } from "./frontendIdentity";
+import { readA2ADelegationRecord, upsertA2ADelegationRecord } from "./skillMemory";
 
 const SKILL_NAME = "sw_unified_knowledge_runtime";
 const SW_PATH = "/sw.js";
@@ -48,6 +50,7 @@ const SUPPORTED_FRONTEND_TOOLS = new Set([
   "opfs_edit_file",
   "delegate_task",
   "get_delegation_status",
+  "list_a2a_discovery_candidates",
 ]);
 
 const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
@@ -299,6 +302,22 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "list_a2a_discovery_candidates",
+      description: "List candidate A2A agents from backend discovery so the frontend LLM can pick a targetAgent.",
+      parameters: {
+        type: "object",
+        properties: {
+          targetAgent: { type: "string" },
+          intent: { type: "string" },
+          capabilities: { type: "array", items: { type: "string" } },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 let frontendToolDefinitionsCache = deepClone(DEFAULT_FRONTEND_TOOL_DEFINITIONS);
@@ -382,8 +401,15 @@ export function hasFrontendTool(name) {
 // Direct backend handlers bypass the service worker and call the REST API.
 const _DIRECT_BACKEND_HANDLERS = {
   async delegate_task({ task, targetAgent, intent }) {
-    const body = { task };
-    if (targetAgent) body.targetAgent = targetAgent;
+    const instanceId = getOrCreateFrontendInstanceId();
+    const body = {
+      task,
+      agentId: instanceId,
+    };
+    const explicitTarget = String(targetAgent || "").trim();
+    if (explicitTarget) {
+      body.targetAgent = explicitTarget;
+    }
     if (intent) body.intent = intent;
     const res = await fetch("/api/agent/delegate", {
       method: "POST",
@@ -394,19 +420,117 @@ const _DIRECT_BACKEND_HANDLERS = {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err?.detail || `delegate_task failed: ${res.status}`);
     }
-    return res.json();
+
+    const data = await res.json();
+    const delegationId = String(data?.delegationId || "").trim();
+    if (delegationId) {
+      const now = String(data?.createdAt || new Date().toISOString());
+      const normalizedTask =
+        task && typeof task === "object" ? task : { text: String(task || "") };
+
+      try {
+        await upsertA2ADelegationRecord(
+          {
+            delegationId,
+            status: String(data?.status || "dispatched").toLowerCase(),
+            targetAgent: String(data?.targetAgent || explicitTarget || ""),
+            fromAgent: instanceId,
+            task: normalizedTask,
+            messages: [
+              { status: "created", timestamp: now },
+              { status: "dispatched", timestamp: now, messageId: String(data?.messageId || "") },
+            ],
+            result: null,
+            error: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+          {
+            tenantId: "tenant-dev",
+            userId: "user-001",
+            agentId: instanceId,
+          },
+        );
+      } catch {
+        // best effort persistence
+      }
+    }
+
+    return data;
   },
 
   async get_delegation_status({ delegationId }) {
-    const res = await fetch(`/api/a2a/delegations/${encodeURIComponent(delegationId)}`);
-    if (res.status === 404) throw new Error(`Delegation ${delegationId} not found`);
+    const id = String(delegationId || "").trim();
+    if (!id) throw new Error("delegationId is required");
+
+    const record = await readA2ADelegationRecord(id, {
+      tenantId: "tenant-dev",
+      userId: "user-001",
+      agentId: getOrCreateFrontendInstanceId(),
+    });
+
+    if (!record) throw new Error(`Delegation ${id} not found in IndexedDB`);
+    return record;
+  },
+
+  async list_a2a_discovery_candidates({ targetAgent, intent, capabilities } = {}) {
+    const params = new URLSearchParams();
+
+    const target = String(targetAgent || "").trim();
+    const hint = String(intent || "").trim();
+    const caps = Array.isArray(capabilities)
+      ? capabilities.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+
+    if (target) params.set("targetAgent", target);
+    if (hint) params.set("intent", hint);
+    if (caps.length) params.set("capabilities", caps.join(","));
+
+    const query = params.toString();
+    const res = await fetch(`/api/a2a/discovery/candidates${query ? `?${query}` : ""}`);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err?.detail || `get_delegation_status failed: ${res.status}`);
+      throw new Error(err?.detail || `list_a2a_discovery_candidates failed: ${res.status}`);
     }
     return res.json();
   },
 };
+
+const TERMINAL_DELEGATION_STATUSES = new Set(["done", "failed", "timeout"]);
+
+export async function pollDelegationUntilTerminal({
+  delegationId,
+  intervalMs = 1500,
+  timeoutMs = 120000,
+} = {}) {
+  const id = String(delegationId || "").trim();
+  if (!id) {
+    throw new Error("delegationId is required");
+  }
+
+  const pollEvery = Math.max(250, Number(intervalMs) || 1500);
+  const timeoutAt = Date.now() + Math.max(1000, Number(timeoutMs) || 120000);
+
+  while (true) {
+    const current = await _DIRECT_BACKEND_HANDLERS.get_delegation_status({
+      delegationId: id,
+    });
+
+    const status = String(current?.status || "").toLowerCase();
+    if (TERMINAL_DELEGATION_STATUSES.has(status)) {
+      return current;
+    }
+
+    if (Date.now() >= timeoutAt) {
+      throw new Error(
+        `pollDelegationUntilTerminal timed out for delegation ${id} (last status: ${status || "unknown"})`,
+      );
+    }
+
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => setTimeout(resolve, pollEvery));
+  }
+}
 
 async function runSkillAction(toolName, args, context) {
   const id = runtimeShared.randomId("skill");

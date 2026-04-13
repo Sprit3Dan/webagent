@@ -8,6 +8,7 @@ import {
   getWebGpuAdapterName,
   isWebGpuSupported,
 } from "./lib/webgpuEmbeddings";
+import { getOrCreateFrontendInstanceId } from "./lib/frontendIdentity";
 
 function urlBase64ToUint8Array(base64String) {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
@@ -87,6 +88,7 @@ async function registerWebPushSubscription(registration) {
       mode: "same-origin",
       body: JSON.stringify({
         subscription: subscription?.toJSON ? subscription.toJSON() : subscription,
+        agentId: getOrCreateFrontendInstanceId(),
       }),
     });
 
