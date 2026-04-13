@@ -4,7 +4,6 @@ const SW_PATH = "/sw.js";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const SKILL_LANGUAGE = "javascript";
 const SKILL_ENTRYPOINT = "executeSkillAction";
-const ACTION_EXECUTOR_JS = "js_code";
 
 const runtimeShared = globalThis?.WebagentRuntimeShared;
 if (!runtimeShared) {
@@ -186,57 +185,7 @@ const DEFAULT_RUNTIME_MODULES = [
   },
 ];
 
-const DEFAULT_RUNTIME_ACTIONS = [
-  {
-    name: "ingest_url",
-    executor: ACTION_EXECUTOR_JS,
-    code: "return await modules.memory.ingestUrl(args, context, kernel);",
-    moduleRefs: ["memory"],
-    enabled: true,
-  },
-  {
-    name: "ingest_text",
-    executor: ACTION_EXECUTOR_JS,
-    code: "return await modules.memory.ingestText(args, context, kernel);",
-    moduleRefs: ["memory"],
-    enabled: true,
-  },
-  {
-    name: "query_memory",
-    executor: ACTION_EXECUTOR_JS,
-    code: "return await modules.memory.queryMemory(args, context, kernel);",
-    moduleRefs: ["memory"],
-    enabled: true,
-  },
-  {
-    name: "list_documents",
-    executor: ACTION_EXECUTOR_JS,
-    code: "return await modules.memory.listDocuments(args, context, kernel);",
-    moduleRefs: ["memory"],
-    enabled: true,
-  },
-  {
-    name: "get_document",
-    executor: ACTION_EXECUTOR_JS,
-    code: "return await modules.memory.getDocument(args, context, kernel);",
-    moduleRefs: ["memory"],
-    enabled: true,
-  },
-  {
-    name: "delete_document",
-    executor: ACTION_EXECUTOR_JS,
-    code: "return await modules.memory.deleteDocument(args, context, kernel);",
-    moduleRefs: ["memory"],
-    enabled: true,
-  },
-  {
-    name: "clear_memory",
-    executor: ACTION_EXECUTOR_JS,
-    code: "return await modules.memory.clearMemory(args, context, kernel);",
-    moduleRefs: ["memory"],
-    enabled: true,
-  },
-];
+
 
 const DEFAULT_RUNTIME_TOOLS = [
   {
@@ -290,6 +239,15 @@ const DEFAULT_RUNTIME_TOOLS = [
   },
 ];
 
+const MEMORY_DEFAULT_SKILL_NAME = "memory_runtime";
+const BUILTIN_SKILL_NAMES = new Set([
+  "memory_runtime",
+  "heartbeat_runtime",
+  "web_search_runtime",
+  "opfs_runtime",
+  "delegation_direct_runtime",
+]);
+
 function nowIso() {
   return runtimeShared.nowIso();
 }
@@ -305,43 +263,7 @@ async function sendToServiceWorker(payload, { timeoutMs = DEFAULT_TIMEOUT_MS } =
   });
 }
 
-function normalizeActions(actions) {
-  const list = Array.isArray(actions) ? actions : [];
-  const seen = new Set();
-  const out = [];
 
-  for (const item of list) {
-    const name = String(item?.name || "").trim();
-    const op = String(item?.op || "").trim();
-    const code = String(item?.code || "").trim();
-    const executorRaw = String(item?.executor || "").trim();
-
-    const executor =
-      executorRaw ||
-      (op ? "builtin_op" : "") ||
-      (code ? "js_code" : "");
-
-    if (!name) continue;
-    if (!executor) continue;
-    if (executor === "builtin_op" && !op) continue;
-    if (executor === "js_code" && !code) continue;
-    if (seen.has(name)) continue;
-    seen.add(name);
-
-    out.push({
-      name,
-      executor,
-      op: executor === "builtin_op" ? (op || name) : "",
-      code: executor === "js_code" ? code : "",
-      enabled: item?.enabled !== false,
-      moduleRefs: Array.isArray(item?.moduleRefs)
-        ? item.moduleRefs.map((x) => String(x || "").trim()).filter(Boolean)
-        : [],
-    });
-  }
-
-  return out;
-}
 
 function normalizeModules(modules) {
   const list = Array.isArray(modules) ? modules : [];
@@ -373,6 +295,11 @@ function normalizeTools(tools) {
   for (const item of list) {
     const name = String(item?.name || "").trim();
     const code = String(item?.code || "").trim();
+    const description = String(item?.description || "").trim();
+    const parameters =
+      item?.parameters && typeof item.parameters === "object" && !Array.isArray(item.parameters)
+        ? item.parameters
+        : { type: "object", properties: {}, additionalProperties: true };
 
     if (!name || !code) continue;
     if (seen.has(name)) continue;
@@ -381,6 +308,8 @@ function normalizeTools(tools) {
     out.push({
       id: String(item?.id || `tool::${name}`),
       name,
+      description,
+      parameters,
       code,
       moduleRefs: Array.isArray(item?.moduleRefs)
         ? item.moduleRefs.map((x) => String(x || "").trim()).filter(Boolean)
@@ -392,22 +321,42 @@ function normalizeTools(tools) {
   return out;
 }
 
+let bootstrapSkillsByNamePromise = null;
+
 async function loadDefaultSkillFromBackend(preferredName) {
   try {
-    const res = await fetch("/api/skills/bootstrap", {
-      method: "GET",
-      headers: { accept: "application/json" },
-      credentials: "same-origin",
-      mode: "same-origin",
-    });
-    if (!res.ok) return null;
+    const preferred = String(preferredName || "").trim();
+    if (!preferred) return null;
 
-    const payload = await res.json();
-    const skills = Array.isArray(payload?.skills) ? payload.skills : [];
-    if (!skills.length) return null;
+    if (!bootstrapSkillsByNamePromise) {
+      bootstrapSkillsByNamePromise = (async () => {
+        const res = await fetch("/api/skills/bootstrap", {
+          method: "GET",
+          headers: { accept: "application/json" },
+          credentials: "same-origin",
+          mode: "same-origin",
+        });
+        if (!res.ok) return new Map();
 
-    const byName = skills.find((s) => String(s?.name || "") === String(preferredName || ""));
-    return byName || skills[0] || null;
+        const payload = await res.json();
+        const skills = Array.isArray(payload?.skills) ? payload.skills : [];
+        const out = new Map();
+
+        for (const skill of skills) {
+          const name = String(skill?.name || "").trim();
+          if (!name || out.has(name)) continue;
+          out.set(name, skill);
+        }
+
+        return out;
+      })().catch(() => {
+        bootstrapSkillsByNamePromise = null;
+        return new Map();
+      });
+    }
+
+    const byName = await bootstrapSkillsByNamePromise;
+    return byName.get(preferred) || null;
   } catch {
     return null;
   }
@@ -418,7 +367,6 @@ function normalizeSkill(input) {
   if (!name) throw new Error("skill.name is required");
 
   const modules = normalizeModules(input?.modules);
-  const actions = normalizeActions(input?.actions);
   const tools = normalizeTools(input?.tools);
 
   if (!tools.length) {
@@ -433,7 +381,6 @@ function normalizeSkill(input) {
     entrypoint: String(input?.entrypoint || SKILL_ENTRYPOINT),
     enabled: input?.enabled !== false,
     modules,
-    actions,
     tools,
   };
 }
@@ -469,22 +416,22 @@ export async function registerDynamicSkill(skillInput, { timeoutMs = DEFAULT_TIM
   return payload?.skill || null;
 }
 
-export async function setDynamicSkillActionEnabled(
-  { skill, action, enabled },
+export async function setDynamicSkillToolEnabled(
+  { skill, tool, enabled },
   { timeoutMs = DEFAULT_TIMEOUT_MS } = {},
 ) {
   const skillName = String(skill || "").trim();
-  const actionName = String(action || "").trim();
+  const toolName = String(tool || "").trim();
 
   if (!skillName) throw new Error("skill is required");
-  if (!actionName) throw new Error("action is required");
+  if (!toolName) throw new Error("tool is required");
 
   const payload = await sendToServiceWorker(
     {
-      type: "skill.action.set",
-      id: randomId("action-set"),
+      type: "skill.tool.set",
+      id: randomId("tool-set"),
       skill: skillName,
-      action: actionName,
+      tool: toolName,
       enabled: !!enabled,
     },
     { timeoutMs },
@@ -522,29 +469,56 @@ export async function createAndRegisterSkill({
   name,
   description = "",
   modules = [],
-  actions = [],
   tools = [],
   enabled = true,
   version = 1,
 }) {
   const shouldLoadDefaults =
     !modules.length &&
-    !actions.length &&
     !tools.length;
+
+  if (shouldLoadDefaults) {
+    const existingRegistry = await listDynamicSkills();
+    const existingSkill = Array.isArray(existingRegistry)
+      ? existingRegistry.find((item) => String(item?.name || "").trim() === String(name || "").trim())
+      : null;
+    const hasUsableTools =
+      Array.isArray(existingSkill?.tools) &&
+      existingSkill.tools.some((tool) => tool?.enabled !== false && tool?.hasInlineCode !== false);
+    if (hasUsableTools) return existingSkill;
+  }
 
   const backendDefault = shouldLoadDefaults
     ? await loadDefaultSkillFromBackend(name)
     : null;
 
-  const source = backendDefault || {
-    name,
-    description,
-    modules,
-    actions,
-    tools,
-    enabled,
-    version,
-  };
+  const normalizedName = String(name || "").trim();
+  const isBuiltinSkill = BUILTIN_SKILL_NAMES.has(normalizedName);
+  const allowMemoryFallback =
+    shouldLoadDefaults &&
+    normalizedName === MEMORY_DEFAULT_SKILL_NAME;
+
+  if (shouldLoadDefaults && !backendDefault && isBuiltinSkill && !allowMemoryFallback) {
+    throw new Error(`No bootstrap default found for built-in skill: ${normalizedName}`);
+  }
+
+  const source = backendDefault || (allowMemoryFallback
+    ? {
+        name,
+        description,
+        modules: DEFAULT_RUNTIME_MODULES,
+        tools: DEFAULT_RUNTIME_TOOLS,
+        enabled,
+        version,
+      }
+    : {
+        name,
+        description,
+        modules,
+        tools,
+        enabled,
+        version,
+      });
 
   const skill = normalizeSkill({
     ...source,

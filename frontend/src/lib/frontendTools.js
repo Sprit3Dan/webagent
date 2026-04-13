@@ -1,8 +1,14 @@
-import { createAndRegisterSkill } from "./skills";
+import { createAndRegisterSkill, listDynamicSkills } from "./skills";
 import { getOrCreateFrontendInstanceId } from "./frontendIdentity";
 import { readA2ADelegationRecord, upsertA2ADelegationRecord } from "./skillMemory";
 
-const SKILL_NAME = "sw_unified_knowledge_runtime";
+const BUILTIN_SKILL_NAMES = Object.freeze({
+  memory: "memory_runtime",
+  heartbeat: "heartbeat_runtime",
+  webSearch: "web_search_runtime",
+  opfs: "opfs_runtime",
+  delegation: "delegation_direct_runtime",
+});
 const SW_PATH = "/sw.js";
 const SW_TIMEOUT_MS = 20_000;
 
@@ -23,8 +29,6 @@ function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-
-
 function parseArgs(rawArgs) {
   const parsed = runtimeShared.parseJsonObjectSafe(rawArgs, {});
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -33,84 +37,45 @@ function parseArgs(rawArgs) {
   throw new Error("Tool arguments must be a JSON object or JSON string");
 }
 
-const SUPPORTED_FRONTEND_TOOLS = new Set([
-  "memory_ingest_url",
-  "memory_ingest_text",
-  "memory_query",
-  "memory_list_documents",
-  "memory_get_document",
-  "memory_delete_document",
-  "memory_clear",
-  "web_search_duckduckgo",
-  "heartbeat_add_pending_item",
-  "heartbeat_list_pending_items",
-  "heartbeat_complete_pending_item",
-  "opfs_read_file",
-  "opfs_write_file",
-  "opfs_edit_file",
-  "delegate_task",
-  "get_delegation_status",
-  "list_a2a_discovery_candidates",
+function inferBuiltInSkillName(toolName) {
+  const name = String(toolName || "").trim();
+  if (!name) return "";
+
+  if (name.startsWith("memory_")) return BUILTIN_SKILL_NAMES.memory;
+  if (name.startsWith("heartbeat_")) return BUILTIN_SKILL_NAMES.heartbeat;
+  if (name === "web_search_duckduckgo") return BUILTIN_SKILL_NAMES.webSearch;
+  if (name.startsWith("opfs_")) return BUILTIN_SKILL_NAMES.opfs;
+  if (
+    name === "delegate_task" ||
+    name === "get_delegation_status" ||
+    name === "list_a2a_discovery_candidates"
+  ) {
+    return BUILTIN_SKILL_NAMES.delegation;
+  }
+
+  return "";
+}
+
+function isToolNameAllowed(name) {
+  const normalized = String(name || "").trim();
+  if (!normalized) return false;
+  if (toolOwnerSkillByName.has(normalized)) return true;
+  return Boolean(_DIRECT_BACKEND_HANDLERS?.[normalized]);
+}
+
+const DEFAULT_ATTACHED_FRONTEND_TOOL_NAMES = new Set([
+  "list_registered_skills",
+  "read_registered_skill",
 ]);
+
+let toolOwnerSkillByName = new Map();
 
 const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "memory_ingest_url",
-      description: "Store URL content in IndexedDB long-term retrieval memory (not guaranteed to be injected into every prompt)",
-      parameters: {
-        type: "object",
-        properties: {
-          url: { type: "string" },
-          title: { type: "string" },
-          tags: { type: "array", items: { type: "string" } },
-          forceRefresh: { type: "boolean" },
-        },
-        required: ["url"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "memory_ingest_text",
-      description: "Store raw text in IndexedDB long-term retrieval memory (not guaranteed to be injected into every prompt)",
-      parameters: {
-        type: "object",
-        properties: {
-          text: { type: "string" },
-          title: { type: "string" },
-          url: { type: "string" },
-          tags: { type: "array", items: { type: "string" } },
-        },
-        required: ["text"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "memory_query",
-      description: "Query IndexedDB long-term retrieval memory and return relevant chunks on demand",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          topK: { type: "number" },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "memory_list_documents",
-      description: "List all IndexedDB long-term memory documents for the current scope",
+      name: "list_registered_skills",
+      description: "List all currently registered dynamic skills available in the frontend runtime.",
       parameters: {
         type: "object",
         properties: {},
@@ -121,206 +86,29 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "memory_get_document",
-      description: "Get one IndexedDB long-term memory document and all of its chunks",
+      name: "read_registered_skill",
+      description: "Read one registered skill by name, including metadata.",
       parameters: {
         type: "object",
         properties: {
-          docId: { type: "string" },
+          name: { type: "string" },
         },
-        required: ["docId"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "memory_delete_document",
-      description: "Delete one document from IndexedDB long-term retrieval memory",
-      parameters: {
-        type: "object",
-        properties: {
-          docId: { type: "string" },
-        },
-        required: ["docId"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "memory_clear",
-      description: "Clear IndexedDB long-term retrieval memory for the current tenant/user/session scope",
-      parameters: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "web_search_duckduckgo",
-      description: "Search the public web via DuckDuckGo instant answer API and return normalized results",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          topK: { type: "number" },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "heartbeat_add_pending_item",
-      description: "Add one pending heartbeat task item with a clear task title and detailed work description",
-      parameters: {
-        type: "object",
-        properties: {
-          text: { type: "string" },
-          description: { type: "string" },
-          priority: { type: "string", enum: ["low", "medium", "high"] },
-        },
-        required: ["text", "description"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "heartbeat_list_pending_items",
-      description: "List all pending heartbeat task items from markdown-backed list",
-      parameters: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "heartbeat_complete_pending_item",
-      description: "Mark one pending heartbeat task item as completed in markdown-backed list",
-      parameters: {
-        type: "object",
-        properties: {
-          itemId: { type: "string" },
-        },
-        required: ["itemId"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "opfs_read_file",
-      description: "Read one allowed OPFS fast-path context file used directly in prompt construction",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", enum: ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] },
-        },
-        required: ["path"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "opfs_write_file",
-      description: "Write full content to one allowed OPFS context file (preferred for durable user/agent/process facts needed in future prompts)",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", enum: ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] },
-          content: { type: "string" },
-        },
-        required: ["path", "content"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "opfs_edit_file",
-      description: "Edit one allowed OPFS context file via append, prepend, or find/replace (OPFS-first for frequently needed guidance)",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", enum: ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] },
-          append: { type: "string" },
-          prepend: { type: "string" },
-          find: { type: "string" },
-          replace: { type: "string" },
-        },
-        required: ["path"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "delegate_task",
-      description: "Delegate a task to a peer agent via A2A. Returns a delegationId to track progress with get_delegation_status.",
-      parameters: {
-        type: "object",
-        properties: {
-          task: { type: "string", description: "Description of the task to delegate" },
-          targetAgent: { type: "string", description: "Explicit peer agent ID; omit for discovery-based routing" },
-          intent: { type: "string", description: "Semantic hint for agent discovery (e.g. 'summarize', 'translate')" },
-        },
-        required: ["task"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "get_delegation_status",
-      description: "Check the status of a previously delegated task by delegationId. Returns status, result, error, and event ledger.",
-      parameters: {
-        type: "object",
-        properties: {
-          delegationId: { type: "string" },
-        },
-        required: ["delegationId"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "list_a2a_discovery_candidates",
-      description: "List candidate A2A agents from backend discovery so the frontend LLM can pick a targetAgent.",
-      parameters: {
-        type: "object",
-        properties: {
-          targetAgent: { type: "string" },
-          intent: { type: "string" },
-          capabilities: { type: "array", items: { type: "string" } },
-        },
+        required: ["name"],
         additionalProperties: false,
       },
     },
   },
 ];
 
-let frontendToolDefinitionsCache = deepClone(DEFAULT_FRONTEND_TOOL_DEFINITIONS);
+function buildDefaultAttachedToolDefinitions() {
+  return deepClone(
+    DEFAULT_FRONTEND_TOOL_DEFINITIONS.filter((item) =>
+      DEFAULT_ATTACHED_FRONTEND_TOOL_NAMES.has(String(item?.function?.name || "").trim()),
+    ),
+  );
+}
+
+let frontendToolDefinitionsCache = buildDefaultAttachedToolDefinitions();
 
 function normalizeToolDefinitions(raw) {
   const arr = Array.isArray(raw) ? raw : [];
@@ -333,7 +121,7 @@ function normalizeToolDefinitions(raw) {
 
     if (type !== "function") continue;
     if (typeof name !== "string" || !name.trim()) continue;
-    if (!SUPPORTED_FRONTEND_TOOLS.has(name)) continue;
+    if (!isToolNameAllowed(name)) continue;
     if (seen.has(name)) continue;
 
     seen.add(name);
@@ -371,8 +159,57 @@ export async function loadFrontendToolDefinitionsFromOpfs({
     return deepClone(frontendToolDefinitionsCache);
   }
 
+  const fallback = buildDefaultAttachedToolDefinitions();
+  const derived = [...fallback];
+  const seen = new Set(
+    fallback
+      .map((item) => String(item?.function?.name || "").trim())
+      .filter(Boolean),
+  );
+  const ownerMap = new Map();
+
+  try {
+    const registry = await listDynamicSkills();
+    const skills = Array.isArray(registry) ? registry : [];
+
+    for (const skill of skills) {
+      if (!skill || skill.enabled === false) continue;
+      const registeredSkillName = String(skill?.name || "").trim();
+      const tools = Array.isArray(skill?.tools) ? skill.tools : [];
+
+      for (const tool of tools) {
+        if (!tool || tool.enabled === false) continue;
+
+        const name = String(tool?.name || "").trim();
+        if (!name || seen.has(name)) continue;
+
+        const description = String(tool?.description || "").trim();
+        const parameters =
+          tool?.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
+            ? tool.parameters
+            : { type: "object", properties: {}, additionalProperties: true };
+
+        ownerMap.set(name, inferBuiltInSkillName(name) || registeredSkillName);
+        seen.add(name);
+        derived.push({
+          type: "function",
+          function: {
+            name,
+            description,
+            parameters,
+          },
+        });
+      }
+    }
+  } catch {
+    // keep fallback-only definitions when skills registry is temporarily unavailable
+  }
+
+  toolOwnerSkillByName = ownerMap;
+  frontendToolDefinitionsCache = normalizeToolDefinitions(derived);
+
   if (!Array.isArray(frontendToolDefinitionsCache) || !frontendToolDefinitionsCache.length) {
-    frontendToolDefinitionsCache = deepClone(DEFAULT_FRONTEND_TOOL_DEFINITIONS);
+    frontendToolDefinitionsCache = normalizeToolDefinitions(fallback);
   }
 
   return deepClone(frontendToolDefinitionsCache);
@@ -393,7 +230,9 @@ export function listFrontendToolDefinitions() {
 }
 
 export function hasFrontendTool(name) {
-  return typeof name === "string" && SUPPORTED_FRONTEND_TOOLS.has(name);
+  const normalized = String(name || "").trim();
+  if (!normalized) return false;
+  return isToolNameAllowed(normalized);
 }
 
 
@@ -494,6 +333,61 @@ const _DIRECT_BACKEND_HANDLERS = {
     }
     return res.json();
   },
+
+  async list_registered_skills() {
+    const registry = await listDynamicSkills();
+    return {
+      count: Array.isArray(registry) ? registry.length : 0,
+      skills: Array.isArray(registry)
+        ? registry.map((skill) => ({
+            name: String(skill?.name || ""),
+            description: String(skill?.description || ""),
+            version: Number(skill?.version || 0),
+            enabled: skill?.enabled !== false,
+            modulesCount: Array.isArray(skill?.modules) ? skill.modules.length : 0,
+            toolsCount: Array.isArray(skill?.tools) ? skill.tools.length : 0,
+          }))
+        : [],
+    };
+  },
+
+  async read_registered_skill({ name } = {}) {
+    const skillName = String(name || "").trim();
+    if (!skillName) throw new Error("name is required");
+
+    const registry = await listDynamicSkills();
+    const skill = Array.isArray(registry)
+      ? registry.find((item) => String(item?.name || "") === skillName)
+      : null;
+
+    if (!skill) throw new Error(`Skill not found: ${skillName}`);
+
+    const payload = {
+      name: String(skill?.name || ""),
+      description: String(skill?.description || ""),
+      version: Number(skill?.version || 0),
+      language: String(skill?.language || ""),
+      entrypoint: String(skill?.entrypoint || ""),
+      enabled: skill?.enabled !== false,
+      modules: Array.isArray(skill?.modules)
+        ? skill.modules.map((m) => ({
+            name: String(m?.name || ""),
+            enabled: m?.enabled !== false,
+          }))
+        : [],
+
+      tools: Array.isArray(skill?.tools)
+        ? skill.tools.map((t) => ({
+            id: String(t?.id || ""),
+            name: String(t?.name || ""),
+            enabled: t?.enabled !== false,
+            moduleRefs: Array.isArray(t?.moduleRefs) ? t.moduleRefs : [],
+          }))
+        : [],
+    };
+
+    return payload;
+  },
 };
 
 const TERMINAL_DELEGATION_STATUSES = new Set(["done", "failed", "timeout"]);
@@ -532,13 +426,17 @@ export async function pollDelegationUntilTerminal({
   }
 }
 
-async function runSkillAction(toolName, args, context) {
+async function runSkillAction(toolName, args, context, skillName) {
   const id = runtimeShared.randomId("skill");
+  const resolvedSkillName = String(skillName || "").trim();
+  if (!resolvedSkillName) {
+    throw new Error(`No owning skill found for tool: ${String(toolName || "").trim()}`);
+  }
   const payload = await runtimeShared.sendToServiceWorker(
     {
       type: "skill.run",
       id,
-      skill: SKILL_NAME,
+      skill: resolvedSkillName,
       action: toolName,
       args: args || {},
       context: context || {},
@@ -558,7 +456,12 @@ export async function executeFrontendToolCall(toolCall, context = {}) {
   const callId = String(toolCall?.id || `frontend-tool-${Date.now()}`);
   const fn = toolCall?.function || {};
   const name = String(fn?.name || "");
-  if (!SUPPORTED_FRONTEND_TOOLS.has(name)) {
+  const attachedToolNames = new Set(
+    (Array.isArray(frontendToolDefinitionsCache) ? frontendToolDefinitionsCache : [])
+      .map((item) => String(item?.function?.name || "").trim())
+      .filter(Boolean),
+  );
+  if (!attachedToolNames.has(name)) {
     const error = `Unknown frontend tool: ${name || "<missing>"}`;
     return {
       toolCallId: callId,
@@ -574,9 +477,14 @@ export async function executeFrontendToolCall(toolCall, context = {}) {
   try {
     const args = parseArgs(fn?.arguments);
     const directHandler = _DIRECT_BACKEND_HANDLERS[name];
+    const ownerSkillName =
+      toolOwnerSkillByName.get(name) || inferBuiltInSkillName(name);
+    if (!directHandler && !ownerSkillName) {
+      throw new Error(`No owning skill found for tool: ${name}`);
+    }
     const result = directHandler
       ? await directHandler(args)
-      : await runSkillAction(name, args, context);
+      : await runSkillAction(name, args, context, ownerSkillName);
 
     return {
       toolCallId: callId,
@@ -623,9 +531,17 @@ export function toFrontendToolMessage(result) {
   };
 }
 
-// Warm cache from OPFS on import, then ensure default runtime skill exists in IndexedDB.
+// Warm cache from OPFS on import, then ensure built-in runtime skills exist in IndexedDB.
 void loadFrontendToolDefinitionsFromOpfs({ persistFallback: true })
-  .then(() => createAndRegisterSkill({ name: SKILL_NAME }))
+  .then(() =>
+    Promise.all([
+      createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.memory }),
+      createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.heartbeat }),
+      createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.webSearch }),
+      createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.opfs }),
+      createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.delegation }),
+    ]),
+  )
   .catch(() => {
     // best effort bootstrap; runtime can still function with existing registry state
   });

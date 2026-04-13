@@ -42,6 +42,7 @@ export default function MessageCard({ msg }) {
   const m = sanitizeMessage(msg);
   const role = m.role.toLowerCase();
   const { accent, background } = roleStyle(role);
+  const promptMemories = Array.isArray(m?.prompt_memories) ? m.prompt_memories : [];
 
   return (
     <article
@@ -71,6 +72,38 @@ export default function MessageCard({ msg }) {
       <div style={{ lineHeight: 1.45, color: "#d6e2ee" }}>
         <ReactMarkdown>{m.content}</ReactMarkdown>
       </div>
+
+      {promptMemories.length ? (
+        <details style={{ marginTop: 8 }}>
+          <summary style={{ cursor: "pointer", color: "#93a6b7", fontSize: 12 }}>
+            applied memory facts ({promptMemories.length})
+          </summary>
+          <div
+            style={{
+              margin: "8px 0 0",
+              color: "#c7d5e2",
+              borderLeft: "1px solid #2a394a",
+              paddingLeft: 8,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            {promptMemories.map((item, idx) => {
+              const score = Number(item?.score || 0).toFixed(3);
+              const factText = String(item?.factText || item?.text || "").replace(/\s+/g, " ").trim();
+              if (!factText) return null;
+
+              return (
+                <div key={`${item?.id || "memory"}-${idx}`} style={{ fontSize: 12 }}>
+                  <span style={{ color: "#8fb2cf" }}>score={score}</span>
+                  <span style={{ color: "#d6e2ee" }}> · {factText.slice(0, 320)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      ) : null}
 
       {m.reasoning ? (
         <details style={{ marginTop: 8 }}>

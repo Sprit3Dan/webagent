@@ -5,8 +5,6 @@ const SW_VERSION = "3.0.0";
 const CACHE_NAME = "webagent-skill-cache-v3";
 const ACTION_EXECUTOR_JS = "js_code";
 
-const DEFAULT_SKILL_ID = "registry::default";
-const DEFAULT_SKILL_NAME = "sw_unified_knowledge_runtime";
 
 
 
@@ -1020,6 +1018,7 @@ async function listRegisteredSkills() {
 		language: skill.language || "javascript",
 		entrypoint: skill.entrypoint || "executeSkillTool",
 		updatedAt: skill.updatedAt || null,
+		modules: Array.isArray(skill.modules) ? skill.modules : [],
 		tools: toolsBySkill.get(skill.id) || [],
 	}));
 }
@@ -1028,26 +1027,26 @@ async function registerDynamicSkill(skillInput) {
 	const name = String((skillInput && skillInput.name) || "").trim();
 	if (!name) throw new Error("skill.name is required");
 
+	const modulesInput = normalizeModulesInput(skillInput && skillInput.modules);
 	const toolsInput = normalizeToolsInput(skillInput && skillInput.tools);
 	if (!toolsInput.length)
 		throw new Error("skill.tools must be a non-empty array");
 
 	const db = await openDb();
 	const now = nowIso();
-	const existing = (await getByKey(db, SKILLS_STORE, DEFAULT_SKILL_ID)) || null;
-	const skillId = DEFAULT_SKILL_ID;
-	const skillName = DEFAULT_SKILL_NAME;
-	const allSkills = await getAllByStore(db, SKILLS_STORE);
-	const legacySkillIds = (allSkills || [])
-		.map((rec) => String((rec && rec.id) || ""))
-		.filter((id) => id && id !== skillId);
+	const requestedSkillId = String((skillInput && skillInput.id) || "").trim();
+	const fallbackSkillId = String(name || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	const skillId = requestedSkillId || ("skill::" + fallbackSkillId) || randomId("skill");
+	const skillName = name;
+	const existing = (await getByKey(db, SKILLS_STORE, skillId)) || null;
 
 	const tx = db.transaction([SKILLS_STORE, TOOLS_STORE], "readwrite");
 
 	const skillsStore = tx.objectStore(SKILLS_STORE);
 	const toolsStore = tx.objectStore(TOOLS_STORE);
-
-	await pruneLegacySkillsForRegistration(tx, legacySkillIds);
 
 	skillsStore.put({
 		id: skillId,
@@ -1055,8 +1054,9 @@ async function registerDynamicSkill(skillInput) {
 		description: String((skillInput && skillInput.description) || ""),
 		version: Number((skillInput && skillInput.version) || 1),
 		language: String((skillInput && skillInput.language) || "javascript"),
-		entrypoint: "executeSkillTool",
+		entrypoint: String((skillInput && skillInput.entrypoint) || "executeSkillTool"),
 		enabled: !skillInput || skillInput.enabled !== false,
+		modules: modulesInput,
 		createdAt: (existing && existing.createdAt) || now,
 		updatedAt: now,
 	});
@@ -1071,15 +1071,21 @@ async function registerDynamicSkill(skillInput) {
 
 	for (const toolDef of toolsInput) {
 		const toolName = toolDef.name;
+		const toolRecordId = "tool::" + String(skillId) + "::" + String(toolName);
 
 		toolsStore.put({
-			id:
-				toolDef.id ||
-				"tool::" + String(skillId) + "::" + String(toolName),
+			id: toolRecordId,
 			skillId,
 			name: toolName,
-			executor: ACTION_EXECUTOR_JS,
+			executor: toolDef.executor || ACTION_EXECUTOR_JS,
 			code: toolDef.code,
+			description: toolDef.description || "",
+			parameters: toolDef.parameters || {
+				type: "object",
+				properties: {},
+				additionalProperties: true,
+			},
+			moduleRefs: Array.isArray(toolDef.moduleRefs) ? toolDef.moduleRefs : [],
 			enabled: toolDef.enabled,
 			createdAt: now,
 			updatedAt: now,
@@ -1097,25 +1103,7 @@ async function registerDynamicSkill(skillInput) {
 	};
 }
 
-async function pruneLegacySkillsForRegistration(tx, legacySkillIds) {
-	const ids = Array.isArray(legacySkillIds) ? legacySkillIds : [];
-	if (!ids.length) return;
 
-	const skillsStore = tx.objectStore(SKILLS_STORE);
-	const toolsStore = tx.objectStore(TOOLS_STORE);
-
-	for (const legacySkillId of ids) {
-		const legacyTools = await reqToPromise(
-			toolsStore.index("skillId").getAll(IDBKeyRange.only(legacySkillId)),
-		);
-
-		for (const rec of legacyTools || []) {
-			toolsStore.delete(rec.id);
-		}
-
-		skillsStore.delete(legacySkillId);
-	}
-}
 
 async function setSkillToolEnabled(skillName, toolName, enabled) {
 	const name = String(skillName || "").trim();
@@ -1154,6 +1142,41 @@ async function setSkillToolEnabled(skillName, toolName, enabled) {
 
 
 
+function normalizeModulesInput(modules) {
+	const list = Array.isArray(modules) ? modules : [];
+	const seen = new Set();
+	const out = [];
+
+	for (const item of list) {
+		const name = String((item && item.name) || "").trim();
+		const code = String((item && item.code) || "").trim();
+		if (!name || !code) continue;
+		if (seen.has(name)) continue;
+		seen.add(name);
+
+		out.push({
+			name,
+			code,
+			enabled: item?.enabled !== false,
+		});
+	}
+
+	return out;
+}
+
+
+
+function normalizeToolParameters(parameters) {
+	if (parameters && typeof parameters === "object" && !Array.isArray(parameters)) {
+		return parameters;
+	}
+	return {
+		type: "object",
+		properties: {},
+		additionalProperties: true,
+	};
+}
+
 function normalizeToolsInput(tools) {
 	const list = Array.isArray(tools) ? tools : [];
 	const seen = new Set();
@@ -1170,6 +1193,12 @@ function normalizeToolsInput(tools) {
 			id: String(item?.id || ""),
 			name,
 			code,
+			executor: String((item && item.executor) || "").trim() || ACTION_EXECUTOR_JS,
+			description: String((item && item.description) || "").trim(),
+			parameters: normalizeToolParameters(item && item.parameters),
+			moduleRefs: Array.isArray(item?.moduleRefs)
+				? item.moduleRefs.map((v) => String(v || "").trim()).filter(Boolean)
+				: [],
 			enabled: item?.enabled !== false,
 		});
 	}

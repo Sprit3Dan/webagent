@@ -14,7 +14,7 @@ import {
   loadFrontendToolDefinitionsFromOpfs,
   toFrontendToolMessage,
 } from "../lib/frontendTools";
-import { createAndRegisterSkill } from "../lib/skills";
+
 import useA2ADelegation from "./useA2ADelegation";
 import useLlmProviderSettings from "./useLlmProviderSettings";
 import useChatNavigation from "./useChatNavigation";
@@ -22,6 +22,7 @@ import useSessionStorageSync from "./useSessionStorageSync";
 import {
   buildConversationMemoryPromptBlock,
   clearA2ADelegationRecords,
+  clearConversationFactMemories,
   forgetConversationFactsByText,
   listAllSkillMemoryRecords,
   listConversationFactMemories,
@@ -44,7 +45,7 @@ import { buildContextForLlm } from "../lib/contextBuilder";
 import { WEBGPU_EMBEDDINGS_DEFAULTS, embedText } from "../lib/webgpuEmbeddings";
 import { getOrCreateFrontendInstanceId } from "../lib/frontendIdentity";
 
-const SLIDING_WINDOW_ROUNDS = 10;
+const CONTEXT_WINDOW_TOKEN_BUDGET = 32_000;
 const MEMORY_KNN_TOP_K = 12;
 const MEMORY_MIN_SCORE_FLOOR = 0.72;
 const MEMORY_SCORE_MARGIN_FROM_TOP = 0.08;
@@ -56,21 +57,44 @@ const FACT_EXTRACTION_MIN_USER_CHARS = 12;
 const FACT_DEDUP_KNN_THRESHOLD = 0.95;
 const CHAT_RUNTIME_AGENT_ID = getOrCreateFrontendInstanceId();
 
-function pickSlidingWindowMessages(messages, rounds = SLIDING_WINDOW_ROUNDS) {
+function pickSlidingWindowMessages(messages, tokenBudget = CONTEXT_WINDOW_TOKEN_BUDGET) {
   const all = normalizeMessages(Array.isArray(messages) ? messages : []);
   if (!all.length) return [];
 
-  const targetMessages = Math.max(1, Number(rounds) || SLIDING_WINDOW_ROUNDS);
+  const budget = Math.max(1, Number(tokenBudget) || CONTEXT_WINDOW_TOKEN_BUDGET);
   const hasSystemPrefix = String(all[0]?.role || "") === "system";
   const prefix = hasSystemPrefix ? [all[0]] : [];
   const body = hasSystemPrefix ? all.slice(1) : all;
 
-  if (body.length <= targetMessages) {
-    return normalizeMessages([...prefix, ...body]);
+  const estimateMessageTokens = (message) => {
+    const shared = globalThis?.WebagentRuntimeShared;
+    if (shared && typeof shared.estimateMessageTokens === "function") {
+      try {
+        return Math.max(1, Number(shared.estimateMessageTokens(message)) || 1);
+      } catch {
+        // fall through to local fallback
+      }
+    }
+
+    const fallbackContent = String(message?.content || "");
+    if (!fallbackContent.trim()) return 1;
+    return fallbackContent
+      .split(/\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean).length;
+  };
+
+  let used = 0;
+  const selected = [];
+  for (let i = body.length - 1; i >= 0; i -= 1) {
+    const candidate = body[i];
+    const candidateTokens = estimateMessageTokens(candidate);
+    if (selected.length > 0 && used + candidateTokens > budget) break;
+    selected.unshift(candidate);
+    used += candidateTokens;
   }
 
-  const slicedBody = body.slice(-targetMessages);
-  return normalizeMessages([...prefix, ...slicedBody]);
+  return normalizeMessages([...prefix, ...selected]);
 }
 
 function summarizeMemoryHits(hits) {
@@ -498,6 +522,7 @@ export default function useChatSession() {
   const activeDelegationWatchersRef = useRef(new Map());
   const lastSeenDelegationStatusRef = useRef(new Map());
   const postedDelegationNotesRef = useRef(new Map());
+  const autoFollowedDelegationsRef = useRef(new Map());
   const [activeDelegationWatchCount, setActiveDelegationWatchCount] = useState(0);
 
   const pagination = useMemo(
@@ -607,8 +632,6 @@ export default function useChatSession() {
     (async () => {
       try {
         await loadFrontendToolDefinitionsFromOpfs({ persistFallback: true });
-        await createAndRegisterSkill({ name: "sw_unified_knowledge_runtime" });
-
         await initializeLlmProviders();
         await initializeA2A();
       } finally {
@@ -621,7 +644,7 @@ export default function useChatSession() {
     };
   }, [initializeA2A, initializeLlmProviders]);
 
-  const send = useCallback(async (inputText = null) => {
+  const send = useCallback(async (inputText = null, options = {}) => {
     if (isLoading) {
       setStatus("agent: request already in progress");
       return;
@@ -641,16 +664,33 @@ export default function useChatSession() {
     const text = resolvedInput.trim();
     if (!text) return;
 
-    const memoryControl = parseMemoryControlDirectives(text);
-    const ignoreMemoryThisTurn = Boolean(memoryControl?.ignoreMemory);
-    const forgetMemoryQuery = String(memoryControl?.forgetQuery || "").trim();
+    const isInternalPrompt = Boolean(options?.internalPrompt);
+    const memoryControl = isInternalPrompt
+      ? { ignoreMemory: true, forgetQuery: "" }
+      : parseMemoryControlDirectives(text);
+    const ignoreMemoryThisTurn = isInternalPrompt || Boolean(memoryControl?.ignoreMemory);
+    const forgetMemoryQuery = isInternalPrompt
+      ? ""
+      : String(memoryControl?.forgetQuery || "").trim();
 
-    const userMsg = makeUserMessage(text);
-    const nextMessages = normalizeMessages([...messages, userMsg]);
+    const nextMessages = normalizeMessages(
+      isInternalPrompt
+        ? [
+            ...messages,
+            sanitizeMessage({
+              role: "assistant",
+              content: `[internal delegation follow-up]\n${text}`,
+              timestamp: new Date().toISOString(),
+            }),
+          ]
+        : [...messages, makeUserMessage(text)],
+    );
 
-    setMessages(nextMessages);
-    if (typeof inputText !== "string") {
-      setPrompt("");
+    if (!isInternalPrompt) {
+      setMessages(nextMessages);
+      if (typeof inputText !== "string") {
+        setPrompt("");
+      }
     }
 
     setIsLoading(true);
@@ -875,7 +915,7 @@ export default function useChatSession() {
           const historyWithoutCurrent = workingMessages.slice(0, -1);
           const slidingWindowHistory = pickSlidingWindowMessages(
             historyWithoutCurrent,
-            SLIDING_WINDOW_ROUNDS,
+            CONTEXT_WINDOW_TOKEN_BUDGET,
           );
           const currentMessage = String(
             workingMessages[workingMessages.length - 1]?.content || "",
@@ -1033,7 +1073,7 @@ export default function useChatSession() {
         } else if (systemContextMessage) {
           const slidingWindowFollowUp = pickSlidingWindowMessages(
             workingMessages,
-            SLIDING_WINDOW_ROUNDS,
+            CONTEXT_WINDOW_TOKEN_BUDGET,
           );
           requestMessages = normalizeMessages([
             systemContextMessage,
@@ -1043,7 +1083,7 @@ export default function useChatSession() {
 
         const requestMessagesWindowed = pickSlidingWindowMessages(
           requestMessages,
-          SLIDING_WINDOW_ROUNDS,
+          CONTEXT_WINDOW_TOKEN_BUDGET,
         );
 
         const requestRoleCounts = requestMessagesWindowed.reduce((acc, msg) => {
@@ -1052,11 +1092,11 @@ export default function useChatSession() {
           return acc;
         }, {});
 
-        console.info("[context:sliding-window]", {
+        console.info("[context:token-window]", {
           round,
           totalMessages: requestMessagesWindowed.length,
           roleCounts: requestRoleCounts,
-          slidingWindowRounds: SLIDING_WINDOW_ROUNDS,
+          contextWindowTokenBudget: CONTEXT_WINDOW_TOKEN_BUDGET,
         });
 
         const payload = {
@@ -1499,6 +1539,12 @@ export default function useChatSession() {
   const clearCurrentSession = useCallback(async () => {
     setInspectorStatus("clearing session...");
     await clearSessionSnapshot();
+    await clearConversationFactMemories({
+      tenantId: CONTEXT.tenantId,
+      userId: CONTEXT.userId,
+      agentId: CHAT_RUNTIME_AGENT_ID,
+      sessionId: CONTEXT.sessionId,
+    });
     await clearA2ADelegationRecords({
       tenantId: CONTEXT.tenantId,
       userId: CONTEXT.userId,
@@ -1580,12 +1626,27 @@ export default function useChatSession() {
 
       const hasDoneResultText =
         nextStatus === "done" && String(item?.result?.content || "").trim().length > 0;
+      const doneResultKey = `${delegationId}:done:with-result`;
       const shouldPostDoneResultNote =
         hasDoneResultText &&
-        !postedDelegationNotesRef.current.get(`${delegationId}:done:with-result`);
+        !postedDelegationNotesRef.current.get(doneResultKey);
+      const shouldTrackAutoFollowup =
+        hasDoneResultText &&
+        !autoFollowedDelegationsRef.current.get(doneResultKey);
 
       if (prevStatus !== nextStatus || shouldPostDoneResultNote) {
         appendDelegationLifecycleNote(item, nextStatus);
+      }
+
+      if (shouldTrackAutoFollowup) {
+        autoFollowedDelegationsRef.current.set(doneResultKey, true);
+        const delegationResultText = String(item?.result?.content || "").trim();
+        const followupPrompt = [
+          `Delegation ${delegationId} reached done.`,
+          "Use this delegation result to provide the final user-facing answer now:",
+          delegationResultText,
+        ].join("\n\n");
+        void send(followupPrompt, { internalPrompt: true });
       }
 
       noteDelegationStatus(delegationId, nextStatus);
@@ -1596,7 +1657,7 @@ export default function useChatSession() {
     }
 
     setActiveDelegationWatchCount(activeDelegationWatchersRef.current.size);
-  }, [appendDelegationLifecycleNote, delegations, noteDelegationStatus]);
+  }, [appendDelegationLifecycleNote, delegations, noteDelegationStatus, send]);
 
   useEffect(() => {
     if (!activeDelegationWatchCount) return undefined;
@@ -1613,6 +1674,7 @@ export default function useChatSession() {
     activeDelegationWatchersRef.current.clear();
     lastSeenDelegationStatusRef.current.clear();
     postedDelegationNotesRef.current.clear();
+    autoFollowedDelegationsRef.current.clear();
     setActiveDelegationWatchCount(0);
   }, []);
 

@@ -1089,6 +1089,59 @@ export async function forgetConversationFactsByText({
   };
 }
 
+export async function clearConversationFactMemories({
+  tenantId = "tenant-dev",
+  userId = "user-001",
+  agentId = "agent-main",
+  sessionId = null,
+} = {}) {
+  const scope = buildConversationMemoryScope({ tenantId, userId, agentId });
+
+  const matched = await listConversationFactMemories({
+    tenantId,
+    userId,
+    agentId,
+    sessionId,
+    limit: 10_000,
+    offset: 0,
+    sortDesc: true,
+  });
+
+  if (!matched.length) {
+    return {
+      scope,
+      sessionId: String(sessionId || "").trim() || null,
+      deleted: 0,
+      matchedIds: [],
+      skipped: false,
+    };
+  }
+
+  const db = await openSkillMemoryDb();
+  if (!hasStore(db, SKILL_DOCS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${SKILL_DOCS_STORE}`);
+  }
+
+  const tx = db.transaction(SKILL_DOCS_STORE, "readwrite");
+  const store = tx.objectStore(SKILL_DOCS_STORE);
+
+  for (let i = 0; i < matched.length; i += 1) {
+    const row = matched[i];
+    if (!row?.id) continue;
+    store.delete(String(row.id));
+  }
+
+  await txDone(tx);
+
+  return {
+    scope,
+    sessionId: String(sessionId || "").trim() || null,
+    deleted: matched.length,
+    matchedIds: matched.map((row) => String(row?.id || "")).filter(Boolean),
+    skipped: false,
+  };
+}
+
 export async function listConversationTurnMemories({
   tenantId = "tenant-dev",
   userId = "user-001",

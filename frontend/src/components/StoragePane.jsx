@@ -29,6 +29,7 @@ function classifyStorageItem(item) {
 
   if (path.startsWith("indexeddb/tools/")) return "idb_tools";
   if (path.startsWith("indexeddb/skills/")) return "idb_skills";
+  if (path.startsWith("indexeddb/skill_modules/")) return "idb_skill_modules";
   if (path.startsWith("indexeddb/docs/")) return "idb_docs";
   if (path.startsWith("indexeddb/chunks/")) return "idb_chunks";
   if (path.startsWith("indexeddb/")) return "idb_other";
@@ -46,6 +47,7 @@ function buildInspectorSections(items) {
     "opfs_directories",
     "idb_tools",
     "idb_skills",
+    "idb_skill_modules",
     "idb_docs",
     "idb_chunks",
     "idb_other",
@@ -58,6 +60,7 @@ function buildInspectorSections(items) {
     opfs_directories: "OPFS · Directories",
     idb_tools: "IndexedDB · Tools",
     idb_skills: "IndexedDB · Skills",
+    idb_skill_modules: "IndexedDB · Skill Modules",
     idb_docs: "IndexedDB · Docs",
     idb_chunks: "IndexedDB · Chunks",
     idb_other: "IndexedDB · Other Records",
