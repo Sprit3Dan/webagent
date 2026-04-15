@@ -1003,6 +1003,10 @@ async function listRegisteredSkills() {
 		toolsBySkill.get(key).push({
 			id: toolRec.id,
 			name: toolRec.name,
+			description: String((toolRec && toolRec.description) || ""),
+			parameters: normalizeToolParameters(toolRec && toolRec.parameters),
+			executor: String((toolRec && toolRec.executor) || ACTION_EXECUTOR_JS),
+			moduleRefs: Array.isArray(toolRec?.moduleRefs) ? toolRec.moduleRefs : [],
 			enabled: toolRec.enabled !== false,
 			updatedAt: toolRec.updatedAt || null,
 			hasInlineCode: String((toolRec && toolRec.code) || "").trim().length > 0,
@@ -1064,6 +1068,23 @@ async function registerDynamicSkill(skillInput) {
 	const priorTools = await reqToPromise(
 		toolsStore.index("skillId").getAll(IDBKeyRange.only(skillId)),
 	);
+	const priorToolsByName = new Map(
+		(priorTools || [])
+			.filter((rec) => rec && String(rec.name || "").trim())
+			.map((rec) => [String(rec.name || "").trim(), rec]),
+	);
+
+	const isGenericObjectSchema = (schema) => {
+		if (!schema || typeof schema !== "object" || Array.isArray(schema)) return true;
+		const type = String(schema.type || "").trim().toLowerCase();
+		const props = schema.properties;
+		const propCount =
+			props && typeof props === "object" && !Array.isArray(props)
+				? Object.keys(props).length
+				: 0;
+		const required = Array.isArray(schema.required) ? schema.required : [];
+		return type === "object" && propCount === 0 && required.length === 0;
+	};
 
 	for (const rec of priorTools || []) {
 		toolsStore.delete(rec.id);
@@ -1072,6 +1093,13 @@ async function registerDynamicSkill(skillInput) {
 	for (const toolDef of toolsInput) {
 		const toolName = toolDef.name;
 		const toolRecordId = "tool::" + String(skillId) + "::" + String(toolName);
+		const existingTool = priorToolsByName.get(String(toolName || "").trim()) || null;
+		const incomingParameters = normalizeToolParameters(toolDef.parameters);
+		const existingParameters = normalizeToolParameters(existingTool && existingTool.parameters);
+		const parameters =
+			isGenericObjectSchema(incomingParameters) && !isGenericObjectSchema(existingParameters)
+				? existingParameters
+				: incomingParameters;
 
 		toolsStore.put({
 			id: toolRecordId,
@@ -1080,14 +1108,10 @@ async function registerDynamicSkill(skillInput) {
 			executor: toolDef.executor || ACTION_EXECUTOR_JS,
 			code: toolDef.code,
 			description: toolDef.description || "",
-			parameters: toolDef.parameters || {
-				type: "object",
-				properties: {},
-				additionalProperties: true,
-			},
+			parameters,
 			moduleRefs: Array.isArray(toolDef.moduleRefs) ? toolDef.moduleRefs : [],
 			enabled: toolDef.enabled,
-			createdAt: now,
+			createdAt: (existingTool && existingTool.createdAt) || now,
 			updatedAt: now,
 		});
 	}

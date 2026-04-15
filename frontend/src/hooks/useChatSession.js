@@ -21,14 +21,14 @@ import useChatNavigation from "./useChatNavigation";
 import useSessionStorageSync from "./useSessionStorageSync";
 import {
   buildConversationMemoryPromptBlock,
-  clearA2ADelegationRecords,
-  clearConversationFactMemories,
+  clearAllSkillMemoryIndexedDbRecords,
   forgetConversationFactsByText,
   listAllSkillMemoryRecords,
   listConversationFactMemories,
   listStoreRecords,
   readSkillDocument,
   searchConversationMemoryKnn,
+  upgradeDelegationToolSchemasInIndexedDb,
   writeConversationFactMemories,
 } from "../lib/skillMemory";
 import {
@@ -45,6 +45,7 @@ import {
   buildContextForLlm,
   reseedContextBootstrapFilesFromBackend,
 } from "../lib/contextBuilder";
+import { reseedSkillsBootstrapFromBackend } from "../lib/skills";
 import { WEBGPU_EMBEDDINGS_DEFAULTS, embedText } from "../lib/webgpuEmbeddings";
 import { getOrCreateFrontendInstanceId } from "../lib/frontendIdentity";
 
@@ -502,6 +503,7 @@ export default function useChatSession() {
     setA2aEnabledPreference,
     setA2aConfigDefaultsPreference,
     refreshDelegations,
+    listA2ADiscoverySpecialists,
     delegateTask,
   } = useA2ADelegation({ setStatus });
 
@@ -636,6 +638,7 @@ export default function useChatSession() {
     (async () => {
       try {
         await loadFrontendToolDefinitionsFromOpfs({ persistFallback: true });
+        await upgradeDelegationToolSchemasInIndexedDb();
         await initializeLlmProviders();
         await initializeA2A();
       } finally {
@@ -1126,6 +1129,7 @@ export default function useChatSession() {
 
         const streamAssistantId = `stream-assistant-${Date.now()}-${round}`;
         const streamToolPreviewPrefix = `stream-tool-preview-${Date.now()}-${round}`;
+        const streamToolResultPrefix = `stream-tool-result-${Date.now()}-${round}`;
         let liveContent = "";
         let liveReasoning = "";
         let liveToolCalls = null;
@@ -1158,9 +1162,13 @@ export default function useChatSession() {
           const calls = Array.isArray(toolCalls) ? toolCalls : [];
 
           setMessages((prev) => {
-            const base = prev.filter(
-              (m) => !String(m?.timestamp || "").startsWith(streamToolPreviewPrefix),
-            );
+            const base = prev.filter((m) => {
+              const ts = String(m?.timestamp || "");
+              return (
+                !ts.startsWith(streamToolPreviewPrefix) &&
+                !ts.startsWith(streamToolResultPrefix)
+              );
+            });
 
             if (!calls.length) return base;
 
@@ -1182,6 +1190,21 @@ export default function useChatSession() {
           });
 
 
+        };
+
+        const buildToolMessageWithCallContext = (result, callById) => {
+          const base = toFrontendToolMessage(result);
+          const call = callById.get(String(result?.toolCallId || ""));
+          const fn = call?.function || {};
+          const name = typeof fn?.name === "string" && fn.name ? fn.name : String(result?.name || "tool");
+          const rawArgs = typeof fn?.arguments === "string" ? fn.arguments.trim() : "";
+          const callHeader = rawArgs ? `called ${name} ${rawArgs}` : `called ${name}`;
+          const resultText = String(base?.content || "").trim();
+
+          return sanitizeMessage({
+            ...base,
+            content: resultText ? `${callHeader}\n\nresult:\n${resultText}` : callHeader,
+          });
         };
 
         const sseEvents = await postJsonAndConsumeSse(
@@ -1357,23 +1380,49 @@ export default function useChatSession() {
 
         executedTools += resolvedToolResults.length;
 
-        const toolMessages = resolvedToolResults
-          .map((result) => toFrontendToolMessage(result))
-          .map((m) => sanitizeMessage(m));
+        const toolCallById = new Map(
+          (Array.isArray(assistantWithTools?.tool_calls) ? assistantWithTools.tool_calls : [])
+            .map((call) => [String(call?.id || ""), call]),
+        );
 
-        if (!toolMessages.length) break;
+        const committedToolMessages = resolvedToolResults
+          .map((result) => buildToolMessageWithCallContext(result, toolCallById));
 
-        generatedAggregate = [...generatedAggregate, ...toolMessages];
+        if (!committedToolMessages.length) break;
+
+        const liveToolMessages = committedToolMessages.map((msg, idx) =>
+          sanitizeMessage({
+            ...msg,
+            timestamp: `${streamToolResultPrefix}-${idx}`,
+          }),
+        );
+
+        setMessages((prev) => {
+          const base = prev.filter((m) => {
+            const ts = String(m?.timestamp || "");
+            return (
+              !ts.startsWith(streamToolPreviewPrefix) &&
+              !ts.startsWith(streamToolResultPrefix)
+            );
+          });
+          return normalizeMessages([...base, ...liveToolMessages]);
+        });
+
+        generatedAggregate = [...generatedAggregate, ...committedToolMessages];
         workingMessages = normalizeMessages([
           ...workingMessages,
-          ...toolMessages,
+          ...committedToolMessages,
         ]);
       }
 
       setMessages((prev) => {
         const base = prev.filter((m) => {
           const ts = String(m?.timestamp || "");
-          return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
+          return (
+            !ts.startsWith("stream-assistant-") &&
+            !ts.startsWith("stream-tool-preview-") &&
+            !ts.startsWith("stream-tool-result-")
+          );
         });
 
         const shared = globalThis?.WebagentRuntimeShared;
@@ -1419,7 +1468,11 @@ export default function useChatSession() {
         setMessages((prev) =>
           prev.filter((m) => {
             const ts = String(m?.timestamp || "");
-            return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
+            return (
+              !ts.startsWith("stream-assistant-") &&
+              !ts.startsWith("stream-tool-preview-") &&
+              !ts.startsWith("stream-tool-result-")
+            );
           }),
         );
         setStatus("agent: ready · opfs file missing (non-fatal)");
@@ -1427,7 +1480,11 @@ export default function useChatSession() {
         setMessages((prev) => [
           ...prev.filter((m) => {
             const ts = String(m?.timestamp || "");
-            return !ts.startsWith("stream-assistant-") && !ts.startsWith("stream-tool-preview-");
+            return (
+              !ts.startsWith("stream-assistant-") &&
+              !ts.startsWith("stream-tool-preview-") &&
+              !ts.startsWith("stream-tool-result-")
+            );
           }),
           sanitizeMessage({
             role: "assistant",
@@ -1494,17 +1551,28 @@ export default function useChatSession() {
 
   const reseedContextBootstrap = useCallback(async () => {
     setInspectorLoading(true);
-    setInspectorStatus("reseeding OPFS bootstrap files from backend...");
+    setInspectorStatus("reseeding context + skills from backend...");
     try {
-      const result = await reseedContextBootstrapFilesFromBackend();
-      if (!result?.ok) {
-        const reason = result?.error || "unknown error";
+      const contextResult = await reseedContextBootstrapFilesFromBackend();
+      if (!contextResult?.ok) {
+        const reason = contextResult?.error || "unknown error";
         setInspectorStatus(`reseed failed · ${reason}`);
         return;
       }
 
-      const written = Array.isArray(result?.written) ? result.written : [];
-      setInspectorStatus(`reseeded bootstrap · ${written.length} files`);
+      const skillsResult = await reseedSkillsBootstrapFromBackend();
+      if (!skillsResult?.ok) {
+        const reason = skillsResult?.error || "unknown error";
+        setInspectorStatus(`reseed failed · ${reason}`);
+        return;
+      }
+
+      await loadFrontendToolDefinitionsFromOpfs({ persistFallback: true });
+      await upgradeDelegationToolSchemasInIndexedDb();
+
+      const written = Array.isArray(contextResult?.written) ? contextResult.written.length : 0;
+      const skills = Number(skillsResult?.count || 0);
+      setInspectorStatus(`reseeded bootstrap · ${written} files · ${skills} skills`);
       await refreshInspector();
     } catch (err) {
       setInspectorStatus(`reseed failed · ${err instanceof Error ? err.message : "unknown error"}`);
@@ -1564,19 +1632,9 @@ export default function useChatSession() {
   const clearCurrentSession = useCallback(async () => {
     setInspectorStatus("clearing session...");
     await clearSessionSnapshot();
-    await clearConversationFactMemories({
-      tenantId: CONTEXT.tenantId,
-      userId: CONTEXT.userId,
-      agentId: CHAT_RUNTIME_AGENT_ID,
-      sessionId: CONTEXT.sessionId,
-    });
-    await clearA2ADelegationRecords({
-      tenantId: CONTEXT.tenantId,
-      userId: CONTEXT.userId,
-      agentId: CHAT_RUNTIME_AGENT_ID,
-    });
+    const wipe = await clearAllSkillMemoryIndexedDbRecords();
     resetInspectorSelection();
-    setInspectorStatus("session cleared");
+    setInspectorStatus(`session cleared · wiped ${Number(wipe?.totalDeleted || 0)} IndexedDB records`);
     await refreshInspector();
   }, [clearSessionSnapshot, refreshInspector, resetInspectorSelection, setInspectorStatus]);
 
@@ -1763,6 +1821,7 @@ export default function useChatSession() {
     setA2aEnabledPreference,
     setA2aConfigDefaultsPreference,
     refreshDelegations,
+    listA2ADiscoverySpecialists,
     delegateTask,
   };
 }

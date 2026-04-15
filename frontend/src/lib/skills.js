@@ -1,9 +1,7 @@
-
-
 const SW_PATH = "/sw.js";
 const DEFAULT_TIMEOUT_MS = 20_000;
 const SKILL_LANGUAGE = "javascript";
-const SKILL_ENTRYPOINT = "executeSkillAction";
+const SKILL_ENTRYPOINT = "executeSkillTool";
 
 const runtimeShared = globalThis?.WebagentRuntimeShared;
 if (!runtimeShared) {
@@ -101,7 +99,6 @@ const DEFAULT_MEMORY_MODULE_CODE = [
   '  const docMap = new Map(docs.map((d) => [d.id, d]));',
   '  const hits = [];',
   '  for (const c of chunks) {',
-  '    if (hits.length >= topK) break;',
   '    const text = String(c.text || "").toLowerCase();',
   '    let score = 0;',
   '    for (const token of qTokens) if (text.includes(token)) score += 1;',
@@ -185,8 +182,6 @@ const DEFAULT_RUNTIME_MODULES = [
   },
 ];
 
-
-
 const DEFAULT_RUNTIME_TOOLS = [
   {
     id: "tool::memory_ingest_url",
@@ -262,8 +257,6 @@ async function sendToServiceWorker(payload, { timeoutMs = DEFAULT_TIMEOUT_MS } =
     swPath: SW_PATH,
   });
 }
-
-
 
 function normalizeModules(modules) {
   const list = Array.isArray(modules) ? modules : [];
@@ -357,7 +350,7 @@ async function loadDefaultSkillFromBackend(preferredName) {
 
     const byName = await bootstrapSkillsByNamePromise;
     return byName.get(preferred) || null;
-  } catch {
+  } catch (_err) {
     return null;
   }
 }
@@ -465,6 +458,62 @@ export async function loadSkillsManifestFromOpfs() {
   };
 }
 
+export async function reseedSkillsBootstrapFromBackend() {
+  try {
+    bootstrapSkillsByNamePromise = null;
+
+    const res = await fetch("/api/skills/bootstrap", {
+      method: "GET",
+      headers: { accept: "application/json" },
+      credentials: "same-origin",
+      mode: "same-origin",
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      throw new Error(`skills bootstrap fetch failed (${res.status})`);
+    }
+
+    const payload = await res.json().catch(() => ({}));
+    const rawSkills = Array.isArray(payload?.skills) ? payload.skills : [];
+    const normalizedSkills = [];
+    const registered = [];
+
+    for (const raw of rawSkills) {
+      let normalized = null;
+      try {
+        normalized = normalizeSkill(raw || {});
+      } catch (_err) {
+        continue;
+      }
+
+      normalizedSkills.push(normalized);
+
+      // eslint-disable-next-line no-await-in-loop
+      const saved = await registerDynamicSkill(normalized);
+      registered.push(saved || { name: normalized.name });
+    }
+
+    skillsManifestCache = {
+      version: Number(payload?.version || 1),
+      updatedAt: nowIso(),
+      skills: normalizedSkills,
+    };
+
+    return {
+      ok: true,
+      count: registered.length,
+      version: Number(payload?.version || 1),
+      skills: registered,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      count: 0,
+      error: err instanceof Error ? err.message : "skills reseed failed",
+    };
+  }
+}
+
 export async function createAndRegisterSkill({
   name,
   description = "",
@@ -473,9 +522,7 @@ export async function createAndRegisterSkill({
   enabled = true,
   version = 1,
 }) {
-  const shouldLoadDefaults =
-    !modules.length &&
-    !tools.length;
+  const shouldLoadDefaults = !modules.length && !tools.length;
 
   if (shouldLoadDefaults) {
     const existingRegistry = await listDynamicSkills();
@@ -488,9 +535,7 @@ export async function createAndRegisterSkill({
     if (hasUsableTools) return existingSkill;
   }
 
-  const backendDefault = shouldLoadDefaults
-    ? await loadDefaultSkillFromBackend(name)
-    : null;
+  const backendDefault = shouldLoadDefaults ? await loadDefaultSkillFromBackend(name) : null;
 
   const normalizedName = String(name || "").trim();
   const isBuiltinSkill = BUILTIN_SKILL_NAMES.has(normalizedName);

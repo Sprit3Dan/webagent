@@ -70,8 +70,31 @@ export default function useChatNavigation({
   const copyFocusedMessage = useCallback(async () => {
     if (focusedMessageIndex < 0) return false;
     const msg = currentPage?.[focusedMessageIndex];
-    const text = typeof msg?.content === "string" ? msg.content : "";
+    const role = String(msg?.role || "").toLowerCase();
+    let text = typeof msg?.content === "string" ? msg.content : "";
     if (!text || !navigator?.clipboard?.writeText) return false;
+
+    if (role === "tool") {
+      const marker = "\n\nresult:\n";
+      const idx = text.indexOf(marker);
+
+      const toQuotedBlock = (prefix, value) =>
+        String(value || "")
+          .split("\n")
+          .map((line) => `${prefix} ${line}`)
+          .join("\n");
+
+      if (idx >= 0) {
+        const callText = text.slice(0, idx).trim();
+        const resultText = text.slice(idx + marker.length).trim();
+        const callBlock = toQuotedBlock(">", callText || "toolcall");
+        const resultBlock = toQuotedBlock("<", resultText || "");
+        text = resultText ? `${callBlock}\n${resultBlock}` : callBlock;
+      } else {
+        text = toQuotedBlock(">", text.trim());
+      }
+    }
+
     await navigator.clipboard.writeText(text);
     return true;
   }, [currentPage, focusedMessageIndex]);

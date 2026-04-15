@@ -145,7 +145,7 @@ export default function StoragePane({
               opacity: inspectorLoading ? 0.7 : 1,
             }}
           >
-            reseed bootstrap
+            reseed context + skills
           </button>
 
           <button

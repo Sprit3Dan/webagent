@@ -173,6 +173,21 @@ async def _a2a_startup(settings: Settings) -> None:
             else {"content": payload_content or content}
         )
 
+        envelope_payload_raw = envelope.get("payload")
+        envelope_payload = (
+            envelope_payload_raw if isinstance(envelope_payload_raw, dict) else {}
+        )
+        reply_context: dict[str, Any] = {}
+        reply_task = envelope_payload.get("task")
+        if isinstance(reply_task, dict):
+            reply_context["task"] = reply_task
+        reply_intent = envelope_payload.get("intent")
+        if isinstance(reply_intent, str) and reply_intent.strip():
+            reply_context["intent"] = reply_intent.strip()
+        correlation_id = str(envelope.get("correlation_id") or "").strip()
+        if correlation_id:
+            reply_context["correlationId"] = correlation_id
+
         target = to_agent or str(settings.a2a_agent_id or "")
         ws_sent = 0
 
@@ -186,6 +201,7 @@ async def _a2a_startup(settings: Settings) -> None:
                 target_agent=target,
                 result=result_dict,
                 error=None,
+                context=reply_context or None,
                 agent_id=target,
             )
             delivery = ws_result.get("delivery") if isinstance(ws_result, dict) else {}
@@ -228,6 +244,7 @@ async def _a2a_startup(settings: Settings) -> None:
                     target_agent=target,
                     result=result_dict,
                     error=None,
+                    context=reply_context or None,
                     agent_id=target,
                     vapid_private_key=str(settings.web_push_vapid_private_key or ""),
                     vapid_subject=str(settings.web_push_vapid_subject or ""),
@@ -269,6 +286,17 @@ async def _a2a_startup(settings: Settings) -> None:
         elif content:
             normalized_result = {"content": content}
 
+        status_context: dict[str, Any] = {}
+        status_task = payload.get("task")
+        if isinstance(status_task, dict):
+            status_context["task"] = status_task
+        status_intent = payload.get("intent")
+        if isinstance(status_intent, str) and status_intent.strip():
+            status_context["intent"] = status_intent.strip()
+        correlation_id = str(event.get("correlation_id") or "").strip()
+        if correlation_id:
+            status_context["correlationId"] = correlation_id
+
         logger.debug(
             "a2a: status received summary=%s normalized_status=%s",
             _a2a_event_summary(event),
@@ -300,6 +328,7 @@ async def _a2a_startup(settings: Settings) -> None:
                 target_agent=target,
                 result=normalized_result,
                 error=error if isinstance(error, str) else None,
+                context=status_context or None,
                 agent_id=target,
             )
             delivery = ws_result.get("delivery") if isinstance(ws_result, dict) else {}
@@ -349,6 +378,7 @@ async def _a2a_startup(settings: Settings) -> None:
                 target_agent=target,
                 result=normalized_result,
                 error=error if isinstance(error, str) else None,
+                context=status_context or None,
                 agent_id=target,
                 vapid_private_key=str(settings.web_push_vapid_private_key or ""),
                 vapid_subject=str(settings.web_push_vapid_subject or ""),

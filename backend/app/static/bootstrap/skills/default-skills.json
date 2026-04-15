@@ -15,49 +15,213 @@
           "name": "memory_ingest_url",
           "description": "Store URL content in IndexedDB long-term retrieval memory (not guaranteed to be injected into every prompt).",
           "enabled": true,
-          "code": "const url = String(args.url || \"\").trim();\nif (!url) throw new Error(\"url is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst tags = Array.isArray(args.tags) ? args.tags.map(String) : [];\nconst force = !!args.forceRefresh;\nconst res = await fetch(url, { cache: \"no-store\", mode: \"cors\" });\nif (!res.ok) throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);\nconst contentType = res.headers.get(\"content-type\") || \"\";\nconst raw = await res.text();\nconst text = contentType.includes(\"text/html\") ? kernel.stripHtmlToText(raw) : raw;\nconst db = await kernel.openDb();\nconst existing = await kernel.findDocBySource(db, scope, url);\nconst docId = existing?.id || kernel.randomId(\"doc\");\nconst createdAt = existing?.createdAt || kernel.nowIso();\nconst updatedAt = kernel.nowIso();\nconst chunks = kernel.chunkText(text);\nif (!chunks.length) throw new Error(\"No usable content after chunking\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nif (existing && force) await kernel.deleteChunksByDoc(chunksStore, docId);\ndocsStore.put({\n  id: docId, scope, sourceUrl: url, title: String(args.title || url), tags,\n  textLength: String(text || \"\").length, chunkCount: chunks.length, createdAt, updatedAt\n});\nfor (let i = 0; i < chunks.length; i += 1) {\n  const chunkText = chunks[i];\n  const tokens = kernel.tokenize(chunkText);\n  chunksStore.put({\n    id: `${docId}::${i}`, scope, docId, index: i, text: chunkText,\n    tokenFreq: kernel.freqMap(tokens), tokenCount: tokens.length, createdAt, updatedAt\n  });\n}\nawait kernel.txDone(tx);\nreturn { docId, sourceUrl: url, title: String(args.title || url), chunkCount: chunks.length, scope, updatedAt };"
+          "code": "const url = String(args.url || \"\").trim();\nif (!url) throw new Error(\"url is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst tags = Array.isArray(args.tags) ? args.tags.map(String) : [];\nconst force = !!args.forceRefresh;\nconst res = await fetch(url, { cache: \"no-store\", mode: \"cors\" });\nif (!res.ok) throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);\nconst contentType = res.headers.get(\"content-type\") || \"\";\nconst raw = await res.text();\nconst text = contentType.includes(\"text/html\") ? kernel.stripHtmlToText(raw) : raw;\nconst db = await kernel.openDb();\nconst existing = await kernel.findDocBySource(db, scope, url);\nconst docId = existing?.id || kernel.randomId(\"doc\");\nconst createdAt = existing?.createdAt || kernel.nowIso();\nconst updatedAt = kernel.nowIso();\nconst chunks = kernel.chunkText(text);\nif (!chunks.length) throw new Error(\"No usable content after chunking\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nif (existing && force) await kernel.deleteChunksByDoc(chunksStore, docId);\ndocsStore.put({\n  id: docId, scope, sourceUrl: url, title: String(args.title || url), tags,\n  textLength: String(text || \"\").length, chunkCount: chunks.length, createdAt, updatedAt\n});\nfor (let i = 0; i < chunks.length; i += 1) {\n  const chunkText = chunks[i];\n  const tokens = kernel.tokenize(chunkText);\n  chunksStore.put({\n    id: `${docId}::${i}`, scope, docId, index: i, text: chunkText,\n    tokenFreq: kernel.freqMap(tokens), tokenCount: tokens.length, createdAt, updatedAt\n  });\n}\nawait kernel.txDone(tx);\nreturn { docId, sourceUrl: url, title: String(args.title || url), chunkCount: chunks.length, scope, updatedAt };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "forceRefresh": {
+                "type": "boolean"
+              },
+              "tenantId": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::memory_ingest_text",
           "name": "memory_ingest_text",
           "description": "Store raw text in IndexedDB long-term retrieval memory (not guaranteed to be injected into every prompt).",
           "enabled": true,
-          "code": "const text = kernel.normalizeText(args.text);\nif (!text) throw new Error(\"text is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst sourceUrl = String(args.url || \"\");\nconst title = String(args.title || \"Untitled note\");\nconst tags = Array.isArray(args.tags) ? args.tags.map(String) : [];\nconst db = await kernel.openDb();\nconst existing = sourceUrl ? await kernel.findDocBySource(db, scope, sourceUrl) : null;\nconst docId = existing?.id || kernel.randomId(\"doc\");\nconst createdAt = existing?.createdAt || kernel.nowIso();\nconst updatedAt = kernel.nowIso();\nconst chunks = kernel.chunkText(text);\nif (!chunks.length) throw new Error(\"No usable content after chunking\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nif (existing) await kernel.deleteChunksByDoc(chunksStore, docId);\ndocsStore.put({\n  id: docId, scope, sourceUrl: sourceUrl || null, title, tags,\n  textLength: String(text || \"\").length, chunkCount: chunks.length, createdAt, updatedAt\n});\nfor (let i = 0; i < chunks.length; i += 1) {\n  const chunkText = chunks[i];\n  const tokens = kernel.tokenize(chunkText);\n  chunksStore.put({\n    id: `${docId}::${i}`, scope, docId, index: i, text: chunkText,\n    tokenFreq: kernel.freqMap(tokens), tokenCount: tokens.length, createdAt, updatedAt\n  });\n}\nawait kernel.txDone(tx);\nreturn { docId, sourceUrl: sourceUrl || null, title, chunkCount: chunks.length, scope, updatedAt };"
+          "code": "const text = kernel.normalizeText(args.text);\nif (!text) throw new Error(\"text is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst sourceUrl = String(args.url || \"\");\nconst title = String(args.title || \"Untitled note\");\nconst tags = Array.isArray(args.tags) ? args.tags.map(String) : [];\nconst db = await kernel.openDb();\nconst existing = sourceUrl ? await kernel.findDocBySource(db, scope, sourceUrl) : null;\nconst docId = existing?.id || kernel.randomId(\"doc\");\nconst createdAt = existing?.createdAt || kernel.nowIso();\nconst updatedAt = kernel.nowIso();\nconst chunks = kernel.chunkText(text);\nif (!chunks.length) throw new Error(\"No usable content after chunking\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nif (existing) await kernel.deleteChunksByDoc(chunksStore, docId);\ndocsStore.put({\n  id: docId, scope, sourceUrl: sourceUrl || null, title, tags,\n  textLength: String(text || \"\").length, chunkCount: chunks.length, createdAt, updatedAt\n});\nfor (let i = 0; i < chunks.length; i += 1) {\n  const chunkText = chunks[i];\n  const tokens = kernel.tokenize(chunkText);\n  chunksStore.put({\n    id: `${docId}::${i}`, scope, docId, index: i, text: chunkText,\n    tokenFreq: kernel.freqMap(tokens), tokenCount: tokens.length, createdAt, updatedAt\n  });\n}\nawait kernel.txDone(tx);\nreturn { docId, sourceUrl: sourceUrl || null, title, chunkCount: chunks.length, scope, updatedAt };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "tenantId": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::memory_query",
           "name": "memory_query",
           "description": "Query IndexedDB long-term retrieval memory on demand; results are not always part of base prompt context.",
           "enabled": true,
-          "code": "const query = kernel.normalizeText(args.query);\nif (!query) throw new Error(\"query is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst topK = Math.max(1, Math.min(20, Number(args.topK || 5)));\nconst db = await kernel.openDb();\nconst [chunks, docs] = await Promise.all([\n  kernel.getAllByIndex(db, kernel.stores.chunks, \"scope\", scope),\n  kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope)\n]);\nif (!chunks.length) return { query, scope, topK, totalChunks: 0, hits: [] };\nconst qTokens = kernel.tokenize(query);\nif (!qTokens.length) return { query, scope, topK, totalChunks: chunks.length, hits: [] };\nconst docMap = new Map(docs.map((d) => [d.id, d]));\nconst hits = [];\nfor (const c of chunks) {\n  const text = String(c.text || \"\").toLowerCase();\n  let score = 0;\n  for (const token of qTokens) if (text.includes(token)) score += 1;\n  if (score <= 0) continue;\n  const d = docMap.get(c.docId) || null;\n  hits.push({\n    score, docId: c.docId, chunkId: c.id, chunkIndex: c.index, text: c.text,\n    title: d?.title || null, sourceUrl: d?.sourceUrl || null, tags: d?.tags || []\n  });\n}\nhits.sort((a, b) => b.score - a.score);\nreturn { query, scope, topK, totalChunks: chunks.length, hits: hits.slice(0, topK) };"
+          "code": "const query = kernel.normalizeText(args.query);\nif (!query) throw new Error(\"query is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst topK = Math.max(1, Math.min(20, Number(args.topK || 5)));\nconst db = await kernel.openDb();\nconst [chunks, docs] = await Promise.all([\n  kernel.getAllByIndex(db, kernel.stores.chunks, \"scope\", scope),\n  kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope)\n]);\nif (!chunks.length) return { query, scope, topK, totalChunks: 0, hits: [] };\nconst qTokens = kernel.tokenize(query);\nif (!qTokens.length) return { query, scope, topK, totalChunks: chunks.length, hits: [] };\nconst docMap = new Map(docs.map((d) => [d.id, d]));\nconst hits = [];\nfor (const c of chunks) {\n  const text = String(c.text || \"\").toLowerCase();\n  let score = 0;\n  for (const token of qTokens) if (text.includes(token)) score += 1;\n  if (score <= 0) continue;\n  const d = docMap.get(c.docId) || null;\n  hits.push({\n    score, docId: c.docId, chunkId: c.id, chunkIndex: c.index, text: c.text,\n    title: d?.title || null, sourceUrl: d?.sourceUrl || null, tags: d?.tags || []\n  });\n}\nhits.sort((a, b) => b.score - a.score);\nreturn { query, scope, topK, totalChunks: chunks.length, hits: hits.slice(0, topK) };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "topK": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20
+              },
+              "tenantId": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::memory_list_documents",
           "name": "memory_list_documents",
           "description": "List IndexedDB long-term memory documents for the current scope.",
           "enabled": true,
-          "code": "const tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst docs = await kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope);\ndocs.sort((a, b) => String(b.updatedAt || \"\").localeCompare(String(a.updatedAt || \"\")));\nreturn {\n  scope,\n  count: docs.length,\n  documents: docs.map((d) => ({\n    id: d.id, title: d.title, sourceUrl: d.sourceUrl, chunkCount: d.chunkCount,\n    tags: d.tags || [], updatedAt: d.updatedAt, createdAt: d.createdAt\n  }))\n};"
+          "code": "const tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst docs = await kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope);\ndocs.sort((a, b) => String(b.updatedAt || \"\").localeCompare(String(a.updatedAt || \"\")));\nreturn {\n  scope,\n  count: docs.length,\n  documents: docs.map((d) => ({\n    id: d.id, title: d.title, sourceUrl: d.sourceUrl, chunkCount: d.chunkCount,\n    tags: d.tags || [], updatedAt: d.updatedAt, createdAt: d.createdAt\n  }))\n};",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tenantId": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::memory_get_document",
           "name": "memory_get_document",
           "description": "Read one IndexedDB long-term memory document and its chunks.",
           "enabled": true,
-          "code": "const docId = String(args.docId || \"\").trim();\nif (!docId) throw new Error(\"docId is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nif (!doc || doc.scope !== scope) throw new Error(\"Document not found\");\nconst chunks = await kernel.getAllByIndex(db, kernel.stores.chunks, \"docId\", docId);\nchunks.sort((a, b) => (a.index || 0) - (b.index || 0));\nreturn {\n  document: doc,\n  chunks: chunks.map((c) => ({ id: c.id, index: c.index, text: c.text, tokenCount: c.tokenCount }))\n};"
+          "code": "const docId = String(args.docId || \"\").trim();\nif (!docId) throw new Error(\"docId is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nif (!doc || doc.scope !== scope) throw new Error(\"Document not found\");\nconst chunks = await kernel.getAllByIndex(db, kernel.stores.chunks, \"docId\", docId);\nchunks.sort((a, b) => (a.index || 0) - (b.index || 0));\nreturn {\n  document: doc,\n  chunks: chunks.map((c) => ({ id: c.id, index: c.index, text: c.text, tokenCount: c.tokenCount }))\n};",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "docId": {
+                "type": "string"
+              },
+              "tenantId": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "docId"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::memory_delete_document",
           "name": "memory_delete_document",
           "description": "Delete one document from IndexedDB long-term memory.",
           "enabled": true,
-          "code": "const docId = String(args.docId || \"\").trim();\nif (!docId) throw new Error(\"docId is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nif (!doc || doc.scope !== scope) throw new Error(\"Document not found\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\ntx.objectStore(kernel.stores.docs).delete(docId);\nawait kernel.deleteChunksByDoc(tx.objectStore(kernel.stores.chunks), docId);\nawait kernel.txDone(tx);\nreturn { ok: true, docId, scope };"
+          "code": "const docId = String(args.docId || \"\").trim();\nif (!docId) throw new Error(\"docId is required\");\nconst tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nif (!doc || doc.scope !== scope) throw new Error(\"Document not found\");\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\ntx.objectStore(kernel.stores.docs).delete(docId);\nawait kernel.deleteChunksByDoc(tx.objectStore(kernel.stores.chunks), docId);\nawait kernel.txDone(tx);\nreturn { ok: true, docId, scope };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "docId": {
+                "type": "string"
+              },
+              "tenantId": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "docId"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::memory_clear",
           "name": "memory_clear",
           "description": "Clear IndexedDB long-term memory for the active scope.",
           "enabled": true,
-          "code": "const tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst [docs, chunks] = await Promise.all([\n  kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope),\n  kernel.getAllByIndex(db, kernel.stores.chunks, \"scope\", scope)\n]);\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nfor (const d of docs) docsStore.delete(d.id);\nfor (const c of chunks) chunksStore.delete(c.id);\nawait kernel.txDone(tx);\nreturn { ok: true, scope, deletedDocuments: docs.length, deletedChunks: chunks.length };"
+          "code": "const tenantId = String(args.tenantId || context.tenantId || \"tenant-dev\");\nconst userId = String(args.userId || context.userId || \"user-001\");\nconst sessionId = String(args.sessionId || context.sessionId || \"default\");\nconst scope = tenantId + \"::\" + userId + \"::\" + sessionId;\nconst db = await kernel.openDb();\nconst [docs, chunks] = await Promise.all([\n  kernel.getAllByIndex(db, kernel.stores.docs, \"scope\", scope),\n  kernel.getAllByIndex(db, kernel.stores.chunks, \"scope\", scope)\n]);\nconst tx = db.transaction([kernel.stores.docs, kernel.stores.chunks], \"readwrite\");\nconst docsStore = tx.objectStore(kernel.stores.docs);\nconst chunksStore = tx.objectStore(kernel.stores.chunks);\nfor (const d of docs) docsStore.delete(d.id);\nfor (const c of chunks) chunksStore.delete(c.id);\nawait kernel.txDone(tx);\nreturn { ok: true, scope, deletedDocuments: docs.length, deletedChunks: chunks.length };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tenantId": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
         }
       ]
     },
@@ -74,19 +238,60 @@
           "id": "tool::heartbeat_add_pending_item",
           "name": "heartbeat_add_pending_item",
           "enabled": true,
-          "code": "const docId = \"system::heartbeat::pending-markdown\";\nconst text = String(args.text || \"\").replace(/\\s+/g, \" \").trim();\nif (!text) throw new Error(\"text is required\");\nconst description = String(args.description || \"\").replace(/\\s+/g, \" \").trim();\nif (!description) throw new Error(\"description is required\");\nconst rawPriority = String(args.priority || \"\").trim().toLowerCase();\nconst priority = /^(low|medium|high)$/.test(rawPriority) ? rawPriority : \"\";\nconst meta = [];\nif (priority) meta.push(\"priority:\" + priority);\nconst suffix = meta.length ? ` [${meta.join(\", \")}]` : \"\";\nconst workText = `${text} — ${description}`;\nconst db = await kernel.openDb();\nconst existing = await kernel.getByKey(db, kernel.stores.docs, docId);\nconst now = kernel.nowIso();\nconst base = \"# Heartbeat Pending Items\\n\\n## Pending\\n\\n<!-- Add pending checklist items here -->\\n\\n## Completed\\n\\n<!-- Completed checklist items -->\\n\";\nconst markdown = String((existing && existing.text) || base);\nconst itemId = kernel.randomId(\"hb\");\nconst line = `- [ ] (${itemId}) ${workText}${suffix}`;\nlet next = markdown;\nif (next.includes(\"\\n## Completed\\n\")) {\n  next = next.replace(/\\n## Completed\\n/, `\\n${line}\\n\\n## Completed\\n`);\n} else {\n  next = `${next.trim()}\\n\\n## Pending\\n\\n${line}\\n\\n## Completed\\n\\n`;\n}\nconst tx = db.transaction(kernel.stores.docs, \"readwrite\");\ntx.objectStore(kernel.stores.docs).put({\n  id: docId,\n  scope: \"system::heartbeat\",\n  title: \"Heartbeat Pending Items\",\n  text: next,\n  createdAt: (existing && existing.createdAt) || now,\n  updatedAt: now\n});\nawait kernel.txDone(tx);\nreturn { ok: true, item: { id: itemId, text, description, priority: priority || null }, pendingCount: (next.match(/^- \\[ \\] \\(([^)]+)\\)\\s*(.*)$/gm) || []).length };"
+          "code": "const docId = \"system::heartbeat::pending-markdown\";\nconst text = String(args.text || \"\").replace(/\\s+/g, \" \").trim();\nif (!text) throw new Error(\"text is required\");\nconst description = String(args.description || \"\").replace(/\\s+/g, \" \").trim();\nif (!description) throw new Error(\"description is required\");\nconst rawPriority = String(args.priority || \"\").trim().toLowerCase();\nconst priority = /^(low|medium|high)$/.test(rawPriority) ? rawPriority : \"\";\nconst meta = [];\nif (priority) meta.push(\"priority:\" + priority);\nconst suffix = meta.length ? ` [${meta.join(\", \")}]` : \"\";\nconst workText = `${text} \u2014 ${description}`;\nconst db = await kernel.openDb();\nconst existing = await kernel.getByKey(db, kernel.stores.docs, docId);\nconst now = kernel.nowIso();\nconst base = \"# Heartbeat Pending Items\\n\\n## Pending\\n\\n<!-- Add pending checklist items here -->\\n\\n## Completed\\n\\n<!-- Completed checklist items -->\\n\";\nconst markdown = String((existing && existing.text) || base);\nconst itemId = kernel.randomId(\"hb\");\nconst line = `- [ ] (${itemId}) ${workText}${suffix}`;\nlet next = markdown;\nif (next.includes(\"\\n## Completed\\n\")) {\n  next = next.replace(/\\n## Completed\\n/, `\\n${line}\\n\\n## Completed\\n`);\n} else {\n  next = `${next.trim()}\\n\\n## Pending\\n\\n${line}\\n\\n## Completed\\n\\n`;\n}\nconst tx = db.transaction(kernel.stores.docs, \"readwrite\");\ntx.objectStore(kernel.stores.docs).put({\n  id: docId,\n  scope: \"system::heartbeat\",\n  title: \"Heartbeat Pending Items\",\n  text: next,\n  createdAt: (existing && existing.createdAt) || now,\n  updatedAt: now\n});\nawait kernel.txDone(tx);\nreturn { ok: true, item: { id: itemId, text, description, priority: priority || null }, pendingCount: (next.match(/^- \\[ \\] \\(([^)]+)\\)\\s*(.*)$/gm) || []).length };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              }
+            },
+            "required": [
+              "text",
+              "description"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::heartbeat_list_pending_items",
           "name": "heartbeat_list_pending_items",
           "enabled": true,
-          "code": "const docId = \"system::heartbeat::pending-markdown\";\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nconst markdown = String((doc && doc.text) || \"\");\nconst pending = [...markdown.matchAll(/^- \\[ \\] \\(([^)]+)\\)\\s*(.*)$/gm)].map((m) => ({ id: String(m[1] || \"\").trim(), text: String(m[2] || \"\").trim() }));\nconst completed = [...markdown.matchAll(/^- \\[x\\] \\(([^)]+)\\)\\s*(.*)$/gim)].map((m) => ({ id: String(m[1] || \"\").trim(), text: String(m[2] || \"\").trim() }));\nreturn { ok: true, pending, completedCount: completed.length, pendingCount: pending.length };"
+          "code": "const docId = \"system::heartbeat::pending-markdown\";\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, docId);\nconst markdown = String((doc && doc.text) || \"\");\nconst pending = [...markdown.matchAll(/^- \\[ \\] \\(([^)]+)\\)\\s*(.*)$/gm)].map((m) => ({ id: String(m[1] || \"\").trim(), text: String(m[2] || \"\").trim() }));\nconst completed = [...markdown.matchAll(/^- \\[x\\] \\(([^)]+)\\)\\s*(.*)$/gim)].map((m) => ({ id: String(m[1] || \"\").trim(), text: String(m[2] || \"\").trim() }));\nreturn { ok: true, pending, completedCount: completed.length, pendingCount: pending.length };",
+          "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::heartbeat_complete_pending_item",
           "name": "heartbeat_complete_pending_item",
           "enabled": true,
-          "code": "const docId = \"system::heartbeat::pending-markdown\";\nconst itemId = String(args.itemId || \"\").trim();\nif (!itemId) throw new Error(\"itemId is required\");\nconst esc = (v) => String(v).replace(/[.*+?^${}()|[\\]\\\\]/g, \"\\\\$&\");\nconst db = await kernel.openDb();\nconst existing = await kernel.getByKey(db, kernel.stores.docs, docId);\nconst markdown = String((existing && existing.text) || \"\");\nconst pendingPattern = new RegExp(`^- \\\\[ \\\\] \\\\(${esc(itemId)}\\\\)\\\\s*(.*)$`, \"m\");\nconst match = markdown.match(pendingPattern);\nif (!match) throw new Error(\"Pending item not found\");\nconst itemText = String(match[1] || \"\").trim();\nconst completedLine = `- [x] (${itemId}) ${itemText} (completed ${kernel.nowIso()})`;\nlet next = markdown.replace(pendingPattern, \"\").replace(/\\n{3,}/g, \"\\n\\n\");\nif (next.includes(\"\\n## Completed\\n\")) {\n  next = next.replace(/\\n## Completed\\n(?:\\n)?/, `\\n## Completed\\n\\n${completedLine}\\n`);\n} else {\n  next = `${next.trim()}\\n\\n## Completed\\n\\n${completedLine}\\n`;\n}\nconst now = kernel.nowIso();\nconst tx = db.transaction(kernel.stores.docs, \"readwrite\");\ntx.objectStore(kernel.stores.docs).put({\n  id: docId,\n  scope: \"system::heartbeat\",\n  title: \"Heartbeat Pending Items\",\n  text: next,\n  createdAt: (existing && existing.createdAt) || now,\n  updatedAt: now\n});\nawait kernel.txDone(tx);\nreturn { ok: true, itemId, text: itemText };"
+          "code": "const docId = \"system::heartbeat::pending-markdown\";\nconst itemId = String(args.itemId || \"\").trim();\nif (!itemId) throw new Error(\"itemId is required\");\nconst esc = (v) => String(v).replace(/[.*+?^${}()|[\\]\\\\]/g, \"\\\\$&\");\nconst db = await kernel.openDb();\nconst existing = await kernel.getByKey(db, kernel.stores.docs, docId);\nconst markdown = String((existing && existing.text) || \"\");\nconst pendingPattern = new RegExp(`^- \\\\[ \\\\] \\\\(${esc(itemId)}\\\\)\\\\s*(.*)$`, \"m\");\nconst match = markdown.match(pendingPattern);\nif (!match) throw new Error(\"Pending item not found\");\nconst itemText = String(match[1] || \"\").trim();\nconst completedLine = `- [x] (${itemId}) ${itemText} (completed ${kernel.nowIso()})`;\nlet next = markdown.replace(pendingPattern, \"\").replace(/\\n{3,}/g, \"\\n\\n\");\nif (next.includes(\"\\n## Completed\\n\")) {\n  next = next.replace(/\\n## Completed\\n(?:\\n)?/, `\\n## Completed\\n\\n${completedLine}\\n`);\n} else {\n  next = `${next.trim()}\\n\\n## Completed\\n\\n${completedLine}\\n`;\n}\nconst now = kernel.nowIso();\nconst tx = db.transaction(kernel.stores.docs, \"readwrite\");\ntx.objectStore(kernel.stores.docs).put({\n  id: docId,\n  scope: \"system::heartbeat\",\n  title: \"Heartbeat Pending Items\",\n  text: next,\n  createdAt: (existing && existing.createdAt) || now,\n  updatedAt: now\n});\nawait kernel.txDone(tx);\nreturn { ok: true, itemId, text: itemText };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "itemId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "itemId"
+            ],
+            "additionalProperties": false
+          }
         }
       ]
     },
@@ -104,7 +309,24 @@
           "name": "web_search_duckduckgo",
           "description": "Search the public web using backend /api/web/search and return normalized results.",
           "enabled": true,
-          "code": "const query = kernel.normalizeText(args.query);\nif (!query) throw new Error(\"query is required\");\nconst topK = Math.max(1, Math.min(20, Number(args.topK || 5)));\nconst res = await fetch(\"/api/web/search\", {\n  method: \"POST\",\n  headers: {\n    \"content-type\": \"application/json\",\n    accept: \"application/json\"\n  },\n  credentials: \"same-origin\",\n  mode: \"same-origin\",\n  body: JSON.stringify({ query, topK })\n});\nif (!res.ok) {\n  let detail = \"\";\n  try { detail = String(await res.text() || \"\").trim(); } catch {}\n  throw new Error(`Web search request failed: ${res.status} ${res.statusText}${detail ? ` - ${detail}` : \"\"}`);\n}\nconst payload = await res.json();\nconst items = Array.isArray(payload && payload.results) ? payload.results : [];\nconst out = items.slice(0, topK).map((item) => ({\n  title: kernel.normalizeText((item && item.title) || \"\"),\n  url: String((item && item.url) || \"\").trim(),\n  snippet: kernel.normalizeText((item && item.snippet) || \"\"),\n  source: String((item && item.source) || \"duckduckgo\")\n})).filter((item) => item.url);\nreturn {\n  ok: true,\n  query,\n  count: out.length,\n  results: out,\n  source: String((payload && payload.source) || \"backend_web_search\"),\n  fetchedAt: String((payload && payload.fetchedAt) || kernel.nowIso())\n};"
+          "code": "const query = kernel.normalizeText(args.query);\nif (!query) throw new Error(\"query is required\");\nconst topK = Math.max(1, Math.min(20, Number(args.topK || 5)));\nconst res = await fetch(\"/api/web/search\", {\n  method: \"POST\",\n  headers: {\n    \"content-type\": \"application/json\",\n    accept: \"application/json\"\n  },\n  credentials: \"same-origin\",\n  mode: \"same-origin\",\n  body: JSON.stringify({ query, topK })\n});\nif (!res.ok) {\n  let detail = \"\";\n  try { detail = String(await res.text() || \"\").trim(); } catch {}\n  throw new Error(`Web search request failed: ${res.status} ${res.statusText}${detail ? ` - ${detail}` : \"\"}`);\n}\nconst payload = await res.json();\nconst items = Array.isArray(payload && payload.results) ? payload.results : [];\nconst out = items.slice(0, topK).map((item) => ({\n  title: kernel.normalizeText((item && item.title) || \"\"),\n  url: String((item && item.url) || \"\").trim(),\n  snippet: kernel.normalizeText((item && item.snippet) || \"\"),\n  source: String((item && item.source) || \"duckduckgo\")\n})).filter((item) => item.url);\nreturn {\n  ok: true,\n  query,\n  count: out.length,\n  results: out,\n  source: String((payload && payload.source) || \"backend_web_search\"),\n  fetchedAt: String((payload && payload.fetchedAt) || kernel.nowIso())\n};",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "topK": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          }
         }
       ]
     },
@@ -122,21 +344,91 @@
           "name": "opfs_read_file",
           "description": "Read one OPFS fast-path context file used directly in prompt construction.",
           "enabled": true,
-          "code": "const path = String(args.path || \"\").trim();\nif (!path) throw new Error(\"path is required\");\nconst allowed = new Set([\"AGENTS.md\", \"SOUL.md\", \"USER.md\", \"TOOLS.md\"]);\nif (!allowed.has(path)) throw new Error(\"path is not allowed\");\nconst nav = (typeof self !== \"undefined\" && self.navigator) ? self.navigator : null;\nif (!nav || !nav.storage || typeof nav.storage.getDirectory !== \"function\") throw new Error(\"OPFS is not supported in this runtime\");\nconst root = await nav.storage.getDirectory();\nconst handle = await root.getFileHandle(path);\nconst file = await handle.getFile();\nconst text = await file.text();\nreturn { ok: true, path, text, bytes: String(text).length };"
+          "code": "const path = String(args.path || \"\").trim();\nif (!path) throw new Error(\"path is required\");\nconst allowed = new Set([\"AGENTS.md\", \"SOUL.md\", \"USER.md\", \"TOOLS.md\"]);\nif (!allowed.has(path)) throw new Error(\"path is not allowed\");\nconst nav = (typeof self !== \"undefined\" && self.navigator) ? self.navigator : null;\nif (!nav || !nav.storage || typeof nav.storage.getDirectory !== \"function\") throw new Error(\"OPFS is not supported in this runtime\");\nconst root = await nav.storage.getDirectory();\nconst handle = await root.getFileHandle(path);\nconst file = await handle.getFile();\nconst text = await file.text();\nreturn { ok: true, path, text, bytes: String(text).length };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "enum": [
+                  "AGENTS.md",
+                  "SOUL.md",
+                  "USER.md",
+                  "TOOLS.md"
+                ]
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::opfs_write_file",
           "name": "opfs_write_file",
           "description": "Write full content to OPFS context files; use for durable user/agent/process facts needed in future prompts.",
           "enabled": true,
-          "code": "const path = String(args.path || \"\").trim();\nif (!path) throw new Error(\"path is required\");\nconst allowed = new Set([\"AGENTS.md\", \"SOUL.md\", \"USER.md\", \"TOOLS.md\"]);\nif (!allowed.has(path)) throw new Error(\"path is not allowed\");\nconst content = String(args.content || \"\");\nconst nav = (typeof self !== \"undefined\" && self.navigator) ? self.navigator : null;\nif (!nav || !nav.storage || typeof nav.storage.getDirectory !== \"function\") throw new Error(\"OPFS is not supported in this runtime\");\nconst root = await nav.storage.getDirectory();\nconst handle = await root.getFileHandle(path, { create: true });\nconst writer = await handle.createWritable();\nawait writer.write(content);\nawait writer.close();\nreturn { ok: true, path, bytes: content.length, updatedAt: kernel.nowIso() };"
+          "code": "const path = String(args.path || \"\").trim();\nif (!path) throw new Error(\"path is required\");\nconst allowed = new Set([\"AGENTS.md\", \"SOUL.md\", \"USER.md\", \"TOOLS.md\"]);\nif (!allowed.has(path)) throw new Error(\"path is not allowed\");\nconst content = String(args.content || \"\");\nconst nav = (typeof self !== \"undefined\" && self.navigator) ? self.navigator : null;\nif (!nav || !nav.storage || typeof nav.storage.getDirectory !== \"function\") throw new Error(\"OPFS is not supported in this runtime\");\nconst root = await nav.storage.getDirectory();\nconst handle = await root.getFileHandle(path, { create: true });\nconst writer = await handle.createWritable();\nawait writer.write(content);\nawait writer.close();\nreturn { ok: true, path, bytes: content.length, updatedAt: kernel.nowIso() };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "enum": [
+                  "AGENTS.md",
+                  "SOUL.md",
+                  "USER.md",
+                  "TOOLS.md"
+                ]
+              },
+              "content": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ],
+            "additionalProperties": false
+          }
         },
         {
           "id": "tool::opfs_edit_file",
           "name": "opfs_edit_file",
           "description": "Edit OPFS context files (append/prepend/find-replace); preferred for frequently needed guidance (OPFS-first).",
           "enabled": true,
-          "code": "const path = String(args.path || \"\").trim();\nif (!path) throw new Error(\"path is required\");\nconst allowed = new Set([\"AGENTS.md\", \"SOUL.md\", \"USER.md\", \"TOOLS.md\"]);\nif (!allowed.has(path)) throw new Error(\"path is not allowed\");\nconst nav = (typeof self !== \"undefined\" && self.navigator) ? self.navigator : null;\nif (!nav || !nav.storage || typeof nav.storage.getDirectory !== \"function\") throw new Error(\"OPFS is not supported in this runtime\");\nconst appendText = args.append != null ? String(args.append) : \"\";\nconst prependText = args.prepend != null ? String(args.prepend) : \"\";\nconst find = args.find != null ? String(args.find) : \"\";\nconst replace = args.replace != null ? String(args.replace) : \"\";\nif (!appendText && !prependText && !find) throw new Error(\"one of append, prepend, or find must be provided\");\nconst root = await nav.storage.getDirectory();\nconst handle = await root.getFileHandle(path, { create: true });\nconst file = await handle.getFile();\nconst before = await file.text();\nlet after = before;\nlet replaced = 0;\nif (prependText) after = prependText + after;\nif (find) {\n  if (!after.includes(find)) throw new Error(\"find text was not found\");\n  after = after.replace(find, replace);\n  replaced = 1;\n}\nif (appendText) after = after + appendText;\nconst writer = await handle.createWritable();\nawait writer.write(after);\nawait writer.close();\nreturn { ok: true, path, bytesBefore: before.length, bytesAfter: after.length, replaced, updatedAt: kernel.nowIso() };"
+          "code": "const path = String(args.path || \"\").trim();\nif (!path) throw new Error(\"path is required\");\nconst allowed = new Set([\"AGENTS.md\", \"SOUL.md\", \"USER.md\", \"TOOLS.md\"]);\nif (!allowed.has(path)) throw new Error(\"path is not allowed\");\nconst nav = (typeof self !== \"undefined\" && self.navigator) ? self.navigator : null;\nif (!nav || !nav.storage || typeof nav.storage.getDirectory !== \"function\") throw new Error(\"OPFS is not supported in this runtime\");\nconst appendText = args.append != null ? String(args.append) : \"\";\nconst prependText = args.prepend != null ? String(args.prepend) : \"\";\nconst find = args.find != null ? String(args.find) : \"\";\nconst replace = args.replace != null ? String(args.replace) : \"\";\nif (!appendText && !prependText && !find) throw new Error(\"one of append, prepend, or find must be provided\");\nconst root = await nav.storage.getDirectory();\nconst handle = await root.getFileHandle(path, { create: true });\nconst file = await handle.getFile();\nconst before = await file.text();\nlet after = before;\nlet replaced = 0;\nif (prependText) after = prependText + after;\nif (find) {\n  if (!after.includes(find)) throw new Error(\"find text was not found\");\n  after = after.replace(find, replace);\n  replaced = 1;\n}\nif (appendText) after = after + appendText;\nconst writer = await handle.createWritable();\nawait writer.write(after);\nawait writer.close();\nreturn { ok: true, path, bytesBefore: before.length, bytesAfter: after.length, replaced, updatedAt: kernel.nowIso() };",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "enum": [
+                  "AGENTS.md",
+                  "SOUL.md",
+                  "USER.md",
+                  "TOOLS.md"
+                ]
+              },
+              "append": {
+                "type": "string"
+              },
+              "prepend": {
+                "type": "string"
+              },
+              "find": {
+                "type": "string"
+              },
+              "replace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
         }
       ]
     },
@@ -153,22 +445,78 @@
           "id": "tool::delegation_delegate_task",
           "name": "delegate_task",
           "description": "Dispatch a delegation request via backend orchestrator.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "task": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                ]
+              },
+              "targetAgent": {
+                "type": "string"
+              },
+              "intent": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "task"
+            ],
+            "additionalProperties": false
+          },
           "enabled": true,
-          "code": "throw new Error(\"delegate_task is handled by direct backend runtime handler\");"
+          "code": "const taskInput = (args && Object.prototype.hasOwnProperty.call(args, \"task\")) ? args.task : null;\nif (taskInput == null || (typeof taskInput === \"string\" && !taskInput.trim())) throw new Error(\"task is required\");\nconst task = (taskInput && typeof taskInput === \"object\") ? taskInput : String(taskInput).trim();\nconst targetAgent = String((args && args.targetAgent) || \"\").trim();\nconst intent = String((args && args.intent) || \"\").trim();\nconst tenantId = String((context && context.tenantId) || \"tenant-dev\");\nconst userId = String((context && context.userId) || \"user-001\");\nconst agentId = String((context && context.agentId) || \"agent-main\");\nconst body = { task: task, agentId: agentId };\nif (targetAgent) body.targetAgent = targetAgent;\nif (intent) body.intent = intent;\nconst res = await fetch(\"/api/agent/delegate\", { method: \"POST\", headers: { \"content-type\": \"application/json\", accept: \"application/json\" }, credentials: \"same-origin\", mode: \"same-origin\", body: JSON.stringify(body) });\nconst data = await res.json().catch(() => ({}));\nif (!res.ok) throw new Error(String((data && data.detail) || (\"delegate_task failed: \" + res.status)));\nconst delegationId = String((data && data.delegationId) || \"\").trim();\nif (delegationId) {\n  const now = String((data && data.createdAt) || kernel.nowIso());\n  const scope = \"a2a-delegations::\" + tenantId + \"::\" + userId + \"::\" + agentId;\n  const id = \"a2a::delegation::\" + delegationId;\n  const record = {\n    delegationId: delegationId,\n    status: String((data && data.status) || \"dispatched\").toLowerCase(),\n    targetAgent: String((data && data.targetAgent) || targetAgent || \"\"),\n    fromAgent: agentId,\n    task: (task && typeof task === \"object\") ? task : { text: String(task || \"\") },\n    messages: [\n      { status: \"created\", timestamp: now },\n      { status: \"dispatched\", timestamp: now, messageId: String((data && data.messageId) || \"\") }\n    ],\n    result: null,\n    error: null,\n    createdAt: now,\n    updatedAt: now\n  };\n  const db = await kernel.openDb();\n  const tx = db.transaction(kernel.stores.docs, \"readwrite\");\n  tx.objectStore(kernel.stores.docs).put({ id: id, scope: scope, kind: \"a2a_delegation\", title: \"A2A Delegation \" + delegationId.slice(0, 8), text: JSON.stringify(record, null, 2), ...record, createdAt: now, updatedAt: now });\n  await kernel.txDone(tx);\n}\nreturn data;"
         },
         {
           "id": "tool::delegation_get_status",
           "name": "get_delegation_status",
           "description": "Read delegation status from frontend memory/backend state.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "delegationId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "delegationId"
+            ],
+            "additionalProperties": false
+          },
           "enabled": true,
-          "code": "throw new Error(\"get_delegation_status is handled by direct backend runtime handler\");"
+          "code": "const delegationId = String((args && args.delegationId) || \"\").trim();\nif (!delegationId) throw new Error(\"delegationId is required\");\nconst tenantId = String((context && context.tenantId) || \"tenant-dev\");\nconst userId = String((context && context.userId) || \"user-001\");\nconst agentId = String((context && context.agentId) || \"agent-main\");\nconst scope = \"a2a-delegations::\" + tenantId + \"::\" + userId + \"::\" + agentId;\nconst id = \"a2a::delegation::\" + delegationId;\nconst db = await kernel.openDb();\nconst doc = await kernel.getByKey(db, kernel.stores.docs, id);\nif (!doc || String((doc && doc.kind) || \"\") !== \"a2a_delegation\") throw new Error(\"Delegation \" + delegationId + \" not found in IndexedDB\");\nif (String((doc && doc.scope) || \"\") !== scope) throw new Error(\"Delegation \" + delegationId + \" not found in current scope\");\nreturn doc;"
         },
         {
           "id": "tool::delegation_list_candidates",
           "name": "list_a2a_discovery_candidates",
           "description": "List A2A specialist candidates by target/intent/capabilities.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "targetAgent": {
+                "type": "string"
+              },
+              "intent": {
+                "type": "string"
+              },
+              "capabilities": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
           "enabled": true,
-          "code": "throw new Error(\"list_a2a_discovery_candidates is handled by direct backend runtime handler\");"
+          "code": "const params = new URLSearchParams();\nconst target = String((args && args.targetAgent) || \"\").trim();\nconst intent = String((args && args.intent) || \"\").trim();\nconst capabilities = Array.isArray(args && args.capabilities) ? args.capabilities.map((item) => String(item || \"\").trim()).filter(Boolean) : [];\nif (target) params.set(\"targetAgent\", target);\nif (intent) params.set(\"intent\", intent);\nif (capabilities.length) params.set(\"capabilities\", capabilities.join(\",\"));\nconst query = params.toString();\nconst res = await fetch(\"/api/a2a/discovery/candidates\" + (query ? (\"?\" + query) : \"\"), { method: \"GET\", headers: { accept: \"application/json\" }, credentials: \"same-origin\", mode: \"same-origin\" });\nconst data = await res.json().catch(() => ({}));\nif (!res.ok) throw new Error(String((data && data.detail) || (\"list_a2a_discovery_candidates failed: \" + res.status)));\nreturn data;"
         }
       ]
     }

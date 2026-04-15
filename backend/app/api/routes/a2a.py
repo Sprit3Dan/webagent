@@ -72,7 +72,7 @@ async def agent_delegate(
             detail="agentId is required",
         )
 
-    target_agent = explicit_target or caller_agent_id
+    target_agent = explicit_target
 
     if explicit_target:
         discovery = get_discovery_client()
@@ -90,7 +90,10 @@ async def agent_delegate(
         allowed_candidates = [
             c
             for c in raw_candidates
-            if not str(c.get("agent_id") or c.get("agentId") or "").strip().startswith("webagent-")
+            if (
+                str(c.get("agent_id") or c.get("agentId") or "").strip() != "webagent"
+                and not str(c.get("agent_id") or c.get("agentId") or "").strip().startswith("webagent-")
+            )
         ]
         matched = any(
             str(c.get("agent_id") or c.get("agentId") or "").strip() == explicit_target
@@ -194,7 +197,10 @@ async def list_discovery_candidates(
     filtered_candidates = [
         c
         for c in candidates
-        if not str(c.get("agent_id") or c.get("agentId") or "").strip().startswith("webagent-")
+        if (
+            str(c.get("agent_id") or c.get("agentId") or "").strip() != "webagent"
+            and not str(c.get("agent_id") or c.get("agentId") or "").strip().startswith("webagent-")
+        )
     ]
 
     return {

@@ -79,9 +79,9 @@ export default function TopBar({
           <button
             onClick={() => onNavigate(ROUTES.A2A)}
             style={navButtonStyle(isA2aRoute)}
-            title="A2A delegation monitor"
+            title="Hotkey: g a"
           >
-            a2a
+            a2a · g a
           </button>
 
           <label style={{ color: "#93a6b7", fontSize: 12 }}>

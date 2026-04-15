@@ -43,6 +43,35 @@ function roleStyle(role) {
   };
 }
 
+function splitToolMessageContent(content) {
+  const raw = String(content || "");
+  const marker = "\n\nresult:\n";
+  const idx = raw.indexOf(marker);
+
+  if (idx < 0) {
+    return {
+      call: raw.trim(),
+      result: "",
+    };
+  }
+
+  return {
+    call: raw.slice(0, idx).trim(),
+    result: raw.slice(idx + marker.length).trim(),
+  };
+}
+
+function formatToolResult(resultText) {
+  const raw = String(resultText || "").trim();
+  if (!raw) return "";
+
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
 export default function MessageCard({ msg }) {
   const m = sanitizeMessage(msg);
   const role = m.role.toLowerCase();
@@ -52,6 +81,9 @@ export default function MessageCard({ msg }) {
   const background = isA2A ? "rgba(179, 136, 255, 0.12)" : baseStyle.background;
   const roleLabel = isA2A ? "A2A" : role.toUpperCase();
   const promptMemories = Array.isArray(m?.prompt_memories) ? m.prompt_memories : [];
+  const isToolMessage = role === "tool";
+  const toolMessage = isToolMessage ? splitToolMessageContent(m.content) : null;
+  const toolResult = isToolMessage ? formatToolResult(toolMessage?.result || "") : "";
 
   return (
     <article
@@ -78,9 +110,34 @@ export default function MessageCard({ msg }) {
         <span style={{ color: "#93a6b7" }}>{m.timestamp}</span>
       </div>
 
-      <div style={{ lineHeight: 1.45, color: "#d6e2ee" }}>
-        <ReactMarkdown>{m.content}</ReactMarkdown>
-      </div>
+      {isToolMessage ? (
+        <details style={{ marginTop: 2 }}>
+          <summary style={{ cursor: "pointer", color: "#93a6b7", fontSize: 12 }}>
+            {toolMessage?.call || "tool result"}
+          </summary>
+          {toolResult ? (
+            <pre
+              style={{
+                margin: "8px 0 0",
+                color: "#c7d5e2",
+                whiteSpace: "pre-wrap",
+                borderLeft: "1px solid #2a394a",
+                paddingLeft: 8,
+              }}
+            >
+              {toolResult}
+            </pre>
+          ) : (
+            <div style={{ marginTop: 8, color: "#8fa3b6", fontSize: 12 }}>
+              No result payload
+            </div>
+          )}
+        </details>
+      ) : (
+        <div style={{ lineHeight: 1.45, color: "#d6e2ee" }}>
+          <ReactMarkdown>{m.content}</ReactMarkdown>
+        </div>
+      )}
 
       {promptMemories.length ? (
         <details style={{ marginTop: 8 }}>

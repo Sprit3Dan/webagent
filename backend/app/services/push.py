@@ -330,6 +330,7 @@ async def publish_a2a_push_update(
     target_agent: str | None = None,
     result: dict[str, Any] | None = None,
     error: str | None = None,
+    context: dict[str, Any] | None = None,
     tenant_id: str | None = None,
     user_id: str | None = None,
     agent_id: str | None = None,
@@ -346,6 +347,7 @@ async def publish_a2a_push_update(
         "targetAgent": _safe_str(target_agent) or None,
         "result": result,
         "error": _safe_str(error) or None,
+        "context": context if isinstance(context, dict) else None,
         "updatedAt": _iso_now(),
     }
 

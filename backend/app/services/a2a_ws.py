@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -203,6 +203,7 @@ class A2AWebSocketHub:
         target_agent: str | None = None,
         result: dict[str, Any] | None = None,
         error: str | None = None,
+        context: dict[str, Any] | None = None,
         tenant_id: str | None = None,
         user_id: str | None = None,
         agent_id: str | None = None,
@@ -216,6 +217,7 @@ class A2AWebSocketHub:
             "targetAgent": _safe_str(target_agent) or None,
             "result": result,
             "error": _safe_str(error) or None,
+            "context": context if isinstance(context, dict) else None,
             "updatedAt": _iso_now(),
         }
 

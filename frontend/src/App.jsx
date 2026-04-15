@@ -59,6 +59,7 @@ function AppShell() {
     setA2aEnabledPreference,
     setA2aConfigDefaultsPreference,
     refreshDelegations,
+    listA2ADiscoverySpecialists,
     delegateTask,
   } = useChatSession();
 
@@ -158,6 +159,7 @@ function AppShell() {
           a2aBackendDefaultEnabled={a2aBackendDefaultEnabled}
           onA2aEnabledChange={setA2aEnabledPreference}
           onRefresh={refreshDelegations}
+          onLoadSpecialists={listA2ADiscoverySpecialists}
           onDelegate={delegateTask}
         />
       ) : (

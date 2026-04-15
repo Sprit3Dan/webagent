@@ -77,6 +77,10 @@ function normalizeA2APushUpdate(data) {
     targetAgent: String(candidate.targetAgent || ""),
     result: candidate.result,
     error: candidate.error,
+    context:
+      candidate.context && typeof candidate.context === "object"
+        ? candidate.context
+        : null,
     updatedAt: String(candidate.updatedAt || new Date().toISOString()),
   };
 }
@@ -96,6 +100,10 @@ function normalizeA2AWSUpdate(data) {
     targetAgent: String(data.targetAgent || ""),
     result: data.result,
     error: data.error,
+    context:
+      data.context && typeof data.context === "object"
+        ? data.context
+        : null,
     updatedAt: String(data.updatedAt || new Date().toISOString()),
   };
 }
@@ -144,6 +152,7 @@ export default function useA2ADelegation({ setStatus } = {}) {
 
       const hasResultUpdate = Object.prototype.hasOwnProperty.call(update, "result");
       const hasErrorUpdate = Object.prototype.hasOwnProperty.call(update, "error");
+      const hasContextUpdate = Object.prototype.hasOwnProperty.call(update, "context");
 
       setDelegations((prev) => {
         const list = Array.isArray(prev) ? prev : [];
@@ -168,6 +177,10 @@ export default function useA2ADelegation({ setStatus } = {}) {
             fromAgent: update.fromAgent || "",
             task: {},
             messages: [eventRow],
+            context:
+              update.context && typeof update.context === "object"
+                ? update.context
+                : null,
             result: update.result ?? null,
             error:
               typeof update.error === "string"
@@ -204,6 +217,10 @@ export default function useA2ADelegation({ setStatus } = {}) {
             hasErrorUpdate && typeof update.error === "string" && update.error.trim()
               ? update.error
               : existing.error ?? null,
+          context:
+            hasContextUpdate && update.context && typeof update.context === "object"
+              ? update.context
+              : existing.context ?? null,
           messages: shouldAppend
             ? [...existingMessages, eventRow]
             : existingMessages,
@@ -362,6 +379,49 @@ export default function useA2ADelegation({ setStatus } = {}) {
     [a2aEnabled],
   );
 
+  const listA2ADiscoverySpecialists = useCallback(
+    async ({ targetAgent, intent, capabilities } = {}) => {
+      if (!a2aEnabled) {
+        return { specialists: [], count: 0, error: "A2A is disabled in UI settings." };
+      }
+
+      const params = new URLSearchParams();
+      const target = String(targetAgent || "").trim();
+      const hint = String(intent || "").trim();
+      const caps = Array.isArray(capabilities)
+        ? capabilities.map((item) => String(item || "").trim()).filter(Boolean)
+        : [];
+
+      if (target) params.set("targetAgent", target);
+      if (hint) params.set("intent", hint);
+      if (caps.length) params.set("capabilities", caps.join(","));
+
+      const query = params.toString();
+      const res = await fetch(`/api/a2a/discovery/candidates${query ? `?${query}` : ""}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return {
+          specialists: [],
+          count: 0,
+          error: data?.detail || `discovery candidates request failed (${res.status})`,
+        };
+      }
+
+      const specialists = Array.isArray(data?.specialists)
+        ? data.specialists
+        : Array.isArray(data?.candidates)
+          ? data.candidates
+          : [];
+
+      return {
+        ...data,
+        specialists,
+        count: Number(data?.count || specialists.length),
+      };
+    },
+    [a2aEnabled],
+  );
+
   const delegateTask = useCallback(
     async ({ task, targetAgent, intent } = {}) => {
       if (!a2aEnabled) {
@@ -370,16 +430,20 @@ export default function useA2ADelegation({ setStatus } = {}) {
 
       try {
         const callerAgentId = getFrontendInstanceId();
-        const resolvedTargetAgent = String(targetAgent || "").trim() || callerAgentId;
+        const resolvedTargetAgent = String(targetAgent || "").trim();
+        const requestBody = {
+          task,
+          agentId: callerAgentId,
+          intent: intent || undefined,
+        };
+        if (resolvedTargetAgent) {
+          requestBody.targetAgent = resolvedTargetAgent;
+        }
+
         const res = await fetch("/api/agent/delegate", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            task,
-            agentId: callerAgentId,
-            targetAgent: resolvedTargetAgent,
-            intent: intent || undefined,
-          }),
+          body: JSON.stringify(requestBody),
         });
         const data = await res.json();
         if (!res.ok) return { error: data?.detail || "delegation failed" };
@@ -538,6 +602,7 @@ export default function useA2ADelegation({ setStatus } = {}) {
     setA2aConfigDefaultsPreference,
     refreshDelegations,
     listA2ADiscoveryCandidates,
+    listA2ADiscoverySpecialists,
     delegateTask,
   };
 }

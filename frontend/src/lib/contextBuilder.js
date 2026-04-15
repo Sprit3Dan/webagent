@@ -151,12 +151,6 @@ export async function buildContextForLlm({
     .filter(Boolean)
     .join("\n\n");
 
-  const systemPrompt = buildSystemPrompt({
-    bootstrapText,
-    memoryText,
-    skillsText: mergedSkillsText,
-  });
-
   const runtimeBlock = buildRuntimeMetadataBlock({
     tenantId,
     userId,
@@ -164,6 +158,17 @@ export async function buildContextForLlm({
     route,
     page,
     metadata,
+  });
+
+  const runtimeMetadataSection = runtimeBlock
+    ? `## Runtime Metadata\n\n${runtimeBlock}`
+    : "";
+
+  const systemPrompt = buildSystemPrompt({
+    bootstrapText,
+    memoryText,
+    skillsText: mergedSkillsText,
+    extraSections: runtimeMetadataSection ? [runtimeMetadataSection] : [],
   });
 
   const normalizedHistory = runtimeShared
@@ -175,7 +180,7 @@ export async function buildContextForLlm({
     ...normalizedHistory.filter((m) => m.role !== "system"),
     {
       role: "user",
-      content: mergeRuntimeWithUserContent(runtimeBlock, currentMessage),
+      content: String(currentMessage || ""),
       timestamp: runtimeShared.nowIso(),
     },
   ];

@@ -10,7 +10,7 @@ function isEditableTarget(target) {
 export default function useChatKeyboard({
   route,
   chatRoute = "/",
-  routes = { chat: "/", storage: "/storage", settings: "/settings" },
+  routes = { chat: "/", storage: "/storage", settings: "/settings", a2a: "/a2a" },
   onNavigate,
   currentPageLength = 0,
   isOnLastPage = true,
@@ -52,7 +52,7 @@ export default function useChatKeyboard({
       if (!editable && key === "g") {
         event.preventDefault();
         pendingGoRef.current = { active: true, ts: now };
-        setStatus?.("go: c=chat · s=storage · ,=settings");
+        setStatus?.("go: c=chat · s=storage · a=a2a · ,=settings");
         return;
       }
 
@@ -67,6 +67,11 @@ export default function useChatKeyboard({
         if (key === "s") {
           event.preventDefault();
           onNavigate?.(routes.storage || "/storage");
+          return;
+        }
+        if (key === "a") {
+          event.preventDefault();
+          onNavigate?.(routes.a2a || "/a2a");
           return;
         }
         if (key === ",") {

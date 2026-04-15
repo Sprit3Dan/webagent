@@ -57,6 +57,91 @@ function hasStore(db, storeName) {
   return db.objectStoreNames.contains(storeName);
 }
 
+const DELEGATION_TOOL_PARAMETER_SCHEMAS = Object.freeze({
+  delegate_task: {
+    type: "object",
+    properties: {
+      task: {
+        anyOf: [
+          { type: "string" },
+          { type: "object", additionalProperties: true },
+        ],
+      },
+      targetAgent: { type: "string" },
+      intent: { type: "string" },
+    },
+    required: ["task"],
+    additionalProperties: false,
+  },
+  get_delegation_status: {
+    type: "object",
+    properties: {
+      delegationId: { type: "string" },
+    },
+    required: ["delegationId"],
+    additionalProperties: false,
+  },
+  list_a2a_discovery_candidates: {
+    type: "object",
+    properties: {
+      targetAgent: { type: "string" },
+      intent: { type: "string" },
+      capabilities: {
+        type: "array",
+        items: { type: "string" },
+      },
+    },
+    additionalProperties: false,
+  },
+});
+
+function isGenericObjectSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return true;
+  const type = String(schema.type || "").trim().toLowerCase();
+  const props = schema.properties;
+  const propCount =
+    props && typeof props === "object" && !Array.isArray(props)
+      ? Object.keys(props).length
+      : 0;
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  return type === "object" && propCount === 0 && required.length === 0;
+}
+
+export async function upgradeDelegationToolSchemasInIndexedDb() {
+  const db = await runtimeShared.openDb();
+  if (!hasStore(db, SKILL_TOOLS_STORE)) {
+    throw new Error(`Missing IndexedDB store: ${SKILL_TOOLS_STORE}`);
+  }
+
+  const tx = db.transaction(SKILL_TOOLS_STORE, "readwrite");
+  const store = tx.objectStore(SKILL_TOOLS_STORE);
+  const allTools = await reqToPromise(store.getAll());
+
+  let updated = 0;
+  for (const rec of Array.isArray(allTools) ? allTools : []) {
+    const toolName = String(rec?.name || "").trim();
+    const expectedSchema = DELEGATION_TOOL_PARAMETER_SCHEMAS[toolName];
+    if (!expectedSchema) continue;
+
+    const currentSchema = rec?.parameters;
+    if (!isGenericObjectSchema(currentSchema)) continue;
+
+    store.put({
+      ...rec,
+      parameters: expectedSchema,
+      updatedAt: new Date().toISOString(),
+    });
+    updated += 1;
+  }
+
+  await txDone(tx);
+  return {
+    ok: true,
+    updated,
+    scanned: Array.isArray(allTools) ? allTools.length : 0,
+  };
+}
+
 export function buildSkillScope({
   tenantId = "tenant-dev",
   userId = "user-001",
@@ -150,6 +235,45 @@ async function getAllByStore(db, storeName) {
 export async function listIndexedDbStores() {
   const db = await openSkillMemoryDb();
   return Array.from(db.objectStoreNames).sort((a, b) => String(a).localeCompare(String(b)));
+}
+
+export async function clearAllSkillMemoryIndexedDbRecords() {
+  const db = await openSkillMemoryDb();
+  const stores = Array.from(db.objectStoreNames);
+
+  if (!stores.length) {
+    return {
+      ok: true,
+      stores: [],
+      deletedByStore: {},
+      totalDeleted: 0,
+    };
+  }
+
+  const tx = db.transaction(stores, "readwrite");
+  const deletedByStore = {};
+
+  for (const storeName of stores) {
+    const store = tx.objectStore(storeName);
+    // eslint-disable-next-line no-await-in-loop
+    const count = Number((await reqToPromise(store.count())) || 0);
+    deletedByStore[storeName] = count;
+    store.clear();
+  }
+
+  await txDone(tx);
+
+  const totalDeleted = Object.values(deletedByStore).reduce(
+    (sum, value) => sum + Number(value || 0),
+    0,
+  );
+
+  return {
+    ok: true,
+    stores,
+    deletedByStore,
+    totalDeleted,
+  };
 }
 
 export async function listStoreRecords(storeName, { limit = 500, offset = 0 } = {}) {

@@ -1,6 +1,5 @@
 import { createAndRegisterSkill, listDynamicSkills } from "./skills";
-import { getOrCreateFrontendInstanceId } from "./frontendIdentity";
-import { readA2ADelegationRecord, upsertA2ADelegationRecord } from "./skillMemory";
+
 
 const BUILTIN_SKILL_NAMES = Object.freeze({
   memory: "memory_runtime",
@@ -45,13 +44,6 @@ function inferBuiltInSkillName(toolName) {
   if (name.startsWith("heartbeat_")) return BUILTIN_SKILL_NAMES.heartbeat;
   if (name === "web_search_duckduckgo") return BUILTIN_SKILL_NAMES.webSearch;
   if (name.startsWith("opfs_")) return BUILTIN_SKILL_NAMES.opfs;
-  if (
-    name === "delegate_task" ||
-    name === "get_delegation_status" ||
-    name === "list_a2a_discovery_candidates"
-  ) {
-    return BUILTIN_SKILL_NAMES.delegation;
-  }
 
   return "";
 }
@@ -66,9 +58,6 @@ function isToolNameAllowed(name) {
 async function resolveEnabledToolOwnerFromRegistry(toolName) {
   const normalized = String(toolName || "").trim();
   if (!normalized) return "";
-
-  const builtinOwner = inferBuiltInSkillName(normalized);
-  if (builtinOwner) return builtinOwner;
 
   try {
     const registry = await listDynamicSkills();
@@ -170,7 +159,7 @@ function normalizeToolDefinitions(raw) {
         parameters:
           item?.function?.parameters && typeof item.function.parameters === "object"
             ? item.function.parameters
-            : { type: "object", properties: {}, additionalProperties: true },
+            : defaultToolParameters(name),
       },
     });
   }
@@ -217,29 +206,11 @@ export async function loadFrontendToolDefinitionsFromOpfs({
         const name = String(tool?.name || "").trim();
         if (!name || seen.has(name)) continue;
 
-        const normalizedToolName = String(tool?.name || "").trim();
-        const rawDescription = String(tool?.description || "").trim();
-        const description =
-          normalizedToolName === "delegate_task"
-            ? "Delegate a task from this local runtime to an A2A candidate. Args: task (required; string or object). Optional: targetAgent (exact agent id), intent (routing hint)."
-            : rawDescription;
+        const description = String(tool?.description || "").trim();
         const parameters =
-          normalizedToolName === "delegate_task"
-            ? {
-                type: "object",
-                properties: {
-                  task: {
-                    anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
-                  },
-                  targetAgent: { type: "string" },
-                  intent: { type: "string" },
-                },
-                required: ["task"],
-                additionalProperties: false,
-              }
-            : tool?.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
-              ? tool.parameters
-              : { type: "object", properties: {}, additionalProperties: true };
+          tool?.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
+            ? tool.parameters
+            : { type: "object", properties: {}, additionalProperties: true };
 
         ownerMap.set(name, inferBuiltInSkillName(name) || registeredSkillName);
         seen.add(name);
@@ -287,121 +258,37 @@ export function hasFrontendTool(name) {
 
 // Direct backend handlers bypass the service worker and call the REST API.
 const _DIRECT_BACKEND_HANDLERS = {
-  async delegate_task(args = {}) {
-    const { task, targetAgent, intent } =
-      args && typeof args === "object" ? args : {};
-    const instanceId = getOrCreateFrontendInstanceId();
-    const normalizedTask =
-      task && typeof task === "object"
-        ? task
-        : String(task || "").trim();
-    const body = {
-      task: normalizedTask,
-      agentId: instanceId,
-    };
-    const explicitTarget = String(targetAgent || "").trim();
-    if (explicitTarget) {
-      body.targetAgent = explicitTarget;
-    }
-    if (intent) body.intent = intent;
-    const res = await fetch("/api/agent/delegate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err?.detail || `delegate_task failed: ${res.status}`);
-    }
 
-    const data = await res.json();
-    const delegationId = String(data?.delegationId || "").trim();
-    if (delegationId) {
-      const now = String(data?.createdAt || new Date().toISOString());
-      const normalizedTask =
-        task && typeof task === "object" ? task : { text: String(task || "") };
 
+  async list_registered_skills() {
+    let registry = await listDynamicSkills();
+
+    if (!Array.isArray(registry) || registry.length === 0) {
       try {
-        await upsertA2ADelegationRecord(
-          {
-            delegationId,
-            status: String(data?.status || "dispatched").toLowerCase(),
-            targetAgent: String(data?.targetAgent || explicitTarget || ""),
-            fromAgent: instanceId,
-            task: normalizedTask,
-            messages: [
-              { status: "created", timestamp: now },
-              { status: "dispatched", timestamp: now, messageId: String(data?.messageId || "") },
-            ],
-            result: null,
-            error: null,
-            createdAt: now,
-            updatedAt: now,
-          },
-          {
-            tenantId: "tenant-dev",
-            userId: "user-001",
-            agentId: instanceId,
-          },
-        );
+        await Promise.all([
+          createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.memory }),
+          createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.heartbeat }),
+          createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.webSearch }),
+          createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.opfs }),
+          createAndRegisterSkill({ name: BUILTIN_SKILL_NAMES.delegation }),
+        ]);
+        registry = await listDynamicSkills();
       } catch {
-        // best effort persistence
+        // keep empty registry response if bootstrap fails
       }
     }
 
-    return data;
-  },
-
-  async get_delegation_status({ delegationId }) {
-    const id = String(delegationId || "").trim();
-    if (!id) throw new Error("delegationId is required");
-
-    const record = await readA2ADelegationRecord(id, {
-      tenantId: "tenant-dev",
-      userId: "user-001",
-      agentId: getOrCreateFrontendInstanceId(),
-    });
-
-    if (!record) throw new Error(`Delegation ${id} not found in IndexedDB`);
-    return record;
-  },
-
-  async list_a2a_discovery_candidates({ targetAgent, intent, capabilities } = {}) {
-    const params = new URLSearchParams();
-
-    const target = String(targetAgent || "").trim();
-    const hint = String(intent || "").trim();
-    const caps = Array.isArray(capabilities)
-      ? capabilities.map((item) => String(item || "").trim()).filter(Boolean)
-      : [];
-
-    if (target) params.set("targetAgent", target);
-    if (hint) params.set("intent", hint);
-    if (caps.length) params.set("capabilities", caps.join(","));
-
-    const query = params.toString();
-    const res = await fetch(`/api/a2a/discovery/candidates${query ? `?${query}` : ""}`);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err?.detail || `list_a2a_discovery_candidates failed: ${res.status}`);
-    }
-    return res.json();
-  },
-
-  async list_registered_skills() {
-    const registry = await listDynamicSkills();
+    const skills = Array.isArray(registry) ? registry : [];
     return {
-      count: Array.isArray(registry) ? registry.length : 0,
-      skills: Array.isArray(registry)
-        ? registry.map((skill) => ({
-            name: String(skill?.name || ""),
-            description: String(skill?.description || ""),
-            version: Number(skill?.version || 0),
-            enabled: skill?.enabled !== false,
-            modulesCount: Array.isArray(skill?.modules) ? skill.modules.length : 0,
-            toolsCount: Array.isArray(skill?.tools) ? skill.tools.length : 0,
-          }))
-        : [],
+      count: skills.length,
+      skills: skills.map((skill) => ({
+        name: String(skill?.name || ""),
+        description: String(skill?.description || ""),
+        version: Number(skill?.version || 0),
+        enabled: skill?.enabled !== false,
+        modulesCount: Array.isArray(skill?.modules) ? skill.modules.length : 0,
+        toolsCount: Array.isArray(skill?.tools) ? skill.tools.length : 0,
+      })),
     };
   },
 
@@ -434,6 +321,11 @@ const _DIRECT_BACKEND_HANDLERS = {
         ? skill.tools.map((t) => ({
             id: String(t?.id || ""),
             name: String(t?.name || ""),
+            description: String(t?.description || ""),
+            parameters:
+              t?.parameters && typeof t.parameters === "object" && !Array.isArray(t.parameters)
+                ? t.parameters
+                : { type: "object", properties: {}, additionalProperties: true },
             enabled: t?.enabled !== false,
             moduleRefs: Array.isArray(t?.moduleRefs) ? t.moduleRefs : [],
           }))
@@ -464,9 +356,12 @@ export async function pollDelegationUntilTerminal({
   const timeoutAt = Date.now() + Math.max(1000, Number(timeoutMs) || 120000);
 
   while (true) {
-    const current = await _DIRECT_BACKEND_HANDLERS.get_delegation_status({
-      delegationId: id,
-    });
+    const current = await runSkillAction(
+      "get_delegation_status",
+      { delegationId: id },
+      {},
+      BUILTIN_SKILL_NAMES.delegation,
+    );
 
     const status = String(current?.status || "").toLowerCase();
     if (TERMINAL_DELEGATION_STATUSES.has(status)) {
@@ -539,8 +434,7 @@ export async function executeFrontendToolCall(toolCall, context = {}) {
     const directHandler = _DIRECT_BACKEND_HANDLERS[name];
     const ownerSkillName =
       toolOwnerSkillByName.get(name) ||
-      ownerFromRegistry ||
-      inferBuiltInSkillName(name);
+      ownerFromRegistry;
     if (!directHandler && !ownerSkillName) {
       throw new Error(`No owning skill found for tool: ${name}`);
     }
