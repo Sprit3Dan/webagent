@@ -17,11 +17,56 @@ const BOOTSTRAP_FILES = [
   AGENT_TOOLS_FILE_NAME,
 ];
 
+export async function reseedContextBootstrapFilesFromBackend() {
+  try {
+    const res = await fetch("/api/context/bootstrap", {
+      method: "GET",
+      headers: { accept: "application/json" },
+      credentials: "same-origin",
+      mode: "same-origin",
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      return { ok: false, written: [], error: `bootstrap fetch failed (${res.status})` };
+    }
+
+    const payload = await res.json().catch(() => ({}));
+    const files = Array.isArray(payload?.files) ? payload.files : [];
+    const written = [];
+
+    for (const entry of files) {
+      const name = String(entry?.name || "").trim();
+      if (!name || !BOOTSTRAP_FILES.includes(name)) continue;
+
+      const content = String(entry?.content || "");
+      // eslint-disable-next-line no-await-in-loop
+      await runtimeShared.writeOpfsTextFile(name, content);
+      written.push(name);
+    }
+
+    return { ok: written.length > 0, written };
+  } catch (err) {
+    return {
+      ok: false,
+      written: [],
+      error: err instanceof Error ? err.message : "bootstrap reseed failed",
+    };
+  }
+}
+
 export async function ensureContextBootstrapFilesInOpfs() {
   try {
     return await runtimeShared.ensureContextBootstrapFilesInOpfs(BOOTSTRAP_FILES);
   } catch {
-    return false;
+    const reseed = await reseedContextBootstrapFilesFromBackend();
+    if (!reseed.ok) return false;
+
+    try {
+      return await runtimeShared.ensureContextBootstrapFilesInOpfs(BOOTSTRAP_FILES);
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -33,17 +78,8 @@ export async function loadContextBootstrapFromOpfs() {
   }
 }
 
-export function buildIdentitySection({
-  tenantId = "tenant-dev",
-  userId = "user-001",
-  sessionId = "chat-001",
-} = {}) {
-  return runtimeShared.buildIdentitySection({
-    tenantId,
-    userId,
-    sessionId,
-    environment: "browser",
-  });
+export function buildIdentitySection() {
+  return "";
 }
 
 export function buildRuntimeMetadataBlock({
@@ -84,6 +120,8 @@ export function mergeRuntimeWithUserContent(runtimeBlock, userText) {
   return runtimeShared.mergeRuntimeWithUserContent(runtimeBlock, userText);
 }
 
+
+
 export async function buildContextForLlm({
   history = [],
   currentMessage = "",
@@ -102,12 +140,21 @@ export async function buildContextForLlm({
   const bootstrapText =
     bootstrap && typeof bootstrap.text === "string" ? bootstrap.text : "";
   const bootstrapFiles = Array.isArray(bootstrap?.files) ? bootstrap.files : [];
-  const identity = buildIdentitySection({ tenantId, userId, sessionId });
+  const runtimeExplorationHint = [
+    "## Runtime Exploration",
+    "- Before using non-default tools, explore the local environment first.",
+    "- Default tools are `list_registered_skills` and `read_local_skill`.",
+    "- Use discovered local skill definitions as the source of truth for additional tools.",
+  ].join("\n");
+  const mergedSkillsText = [skillsText, runtimeExplorationHint]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .join("\n\n");
+
   const systemPrompt = buildSystemPrompt({
-    identitySection: identity,
     bootstrapText,
     memoryText,
-    skillsText,
+    skillsText: mergedSkillsText,
   });
 
   const runtimeBlock = buildRuntimeMetadataBlock({

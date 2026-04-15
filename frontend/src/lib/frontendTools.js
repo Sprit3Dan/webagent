@@ -63,9 +63,43 @@ function isToolNameAllowed(name) {
   return Boolean(_DIRECT_BACKEND_HANDLERS?.[normalized]);
 }
 
+async function resolveEnabledToolOwnerFromRegistry(toolName) {
+  const normalized = String(toolName || "").trim();
+  if (!normalized) return "";
+
+  const builtinOwner = inferBuiltInSkillName(normalized);
+  if (builtinOwner) return builtinOwner;
+
+  try {
+    const registry = await listDynamicSkills();
+    const skills = Array.isArray(registry) ? registry : [];
+
+    for (const skill of skills) {
+      if (!skill || skill.enabled === false) continue;
+
+      const owner = String(skill?.name || "").trim();
+      if (!owner) continue;
+
+      const tools = Array.isArray(skill?.tools) ? skill.tools : [];
+      const found = tools.some(
+        (tool) =>
+          tool &&
+          tool.enabled !== false &&
+          String(tool?.name || "").trim() === normalized,
+      );
+
+      if (found) return owner;
+    }
+  } catch {
+    // best effort lookup
+  }
+
+  return "";
+}
+
 const DEFAULT_ATTACHED_FRONTEND_TOOL_NAMES = new Set([
   "list_registered_skills",
-  "read_registered_skill",
+  "read_local_skill",
 ]);
 
 let toolOwnerSkillByName = new Map();
@@ -86,8 +120,8 @@ const DEFAULT_FRONTEND_TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "read_registered_skill",
-      description: "Read one registered skill by name, including metadata.",
+      name: "read_local_skill",
+      description: "Read one locally registered frontend skill by name, including metadata. This reads local runtime skills only; do not expect meaningful data from delegated agents.",
       parameters: {
         type: "object",
         properties: {
@@ -183,11 +217,29 @@ export async function loadFrontendToolDefinitionsFromOpfs({
         const name = String(tool?.name || "").trim();
         if (!name || seen.has(name)) continue;
 
-        const description = String(tool?.description || "").trim();
+        const normalizedToolName = String(tool?.name || "").trim();
+        const rawDescription = String(tool?.description || "").trim();
+        const description =
+          normalizedToolName === "delegate_task"
+            ? "Delegate a task from this local runtime to an A2A candidate. Args: task (required; string or object). Optional: targetAgent (exact agent id), intent (routing hint)."
+            : rawDescription;
         const parameters =
-          tool?.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
-            ? tool.parameters
-            : { type: "object", properties: {}, additionalProperties: true };
+          normalizedToolName === "delegate_task"
+            ? {
+                type: "object",
+                properties: {
+                  task: {
+                    anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
+                  },
+                  targetAgent: { type: "string" },
+                  intent: { type: "string" },
+                },
+                required: ["task"],
+                additionalProperties: false,
+              }
+            : tool?.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
+              ? tool.parameters
+              : { type: "object", properties: {}, additionalProperties: true };
 
         ownerMap.set(name, inferBuiltInSkillName(name) || registeredSkillName);
         seen.add(name);
@@ -206,11 +258,7 @@ export async function loadFrontendToolDefinitionsFromOpfs({
   }
 
   toolOwnerSkillByName = ownerMap;
-  frontendToolDefinitionsCache = normalizeToolDefinitions(derived);
-
-  if (!Array.isArray(frontendToolDefinitionsCache) || !frontendToolDefinitionsCache.length) {
-    frontendToolDefinitionsCache = normalizeToolDefinitions(fallback);
-  }
+  frontendToolDefinitionsCache = normalizeToolDefinitions(fallback);
 
   return deepClone(frontendToolDefinitionsCache);
 }
@@ -239,10 +287,16 @@ export function hasFrontendTool(name) {
 
 // Direct backend handlers bypass the service worker and call the REST API.
 const _DIRECT_BACKEND_HANDLERS = {
-  async delegate_task({ task, targetAgent, intent }) {
+  async delegate_task(args = {}) {
+    const { task, targetAgent, intent } =
+      args && typeof args === "object" ? args : {};
     const instanceId = getOrCreateFrontendInstanceId();
+    const normalizedTask =
+      task && typeof task === "object"
+        ? task
+        : String(task || "").trim();
     const body = {
-      task,
+      task: normalizedTask,
       agentId: instanceId,
     };
     const explicitTarget = String(targetAgent || "").trim();
@@ -351,7 +405,7 @@ const _DIRECT_BACKEND_HANDLERS = {
     };
   },
 
-  async read_registered_skill({ name } = {}) {
+  async read_local_skill({ name } = {}) {
     const skillName = String(name || "").trim();
     if (!skillName) throw new Error("name is required");
 
@@ -387,6 +441,10 @@ const _DIRECT_BACKEND_HANDLERS = {
     };
 
     return payload;
+  },
+
+  async read_registered_skill(args = {}) {
+    return _DIRECT_BACKEND_HANDLERS.read_local_skill(args);
   },
 };
 
@@ -461,7 +519,9 @@ export async function executeFrontendToolCall(toolCall, context = {}) {
       .map((item) => String(item?.function?.name || "").trim())
       .filter(Boolean),
   );
-  if (!attachedToolNames.has(name)) {
+  const hasDirectHandler = typeof _DIRECT_BACKEND_HANDLERS?.[name] === "function";
+  const ownerFromRegistry = await resolveEnabledToolOwnerFromRegistry(name);
+  if (!attachedToolNames.has(name) && !hasDirectHandler && !ownerFromRegistry) {
     const error = `Unknown frontend tool: ${name || "<missing>"}`;
     return {
       toolCallId: callId,
@@ -478,7 +538,9 @@ export async function executeFrontendToolCall(toolCall, context = {}) {
     const args = parseArgs(fn?.arguments);
     const directHandler = _DIRECT_BACKEND_HANDLERS[name];
     const ownerSkillName =
-      toolOwnerSkillByName.get(name) || inferBuiltInSkillName(name);
+      toolOwnerSkillByName.get(name) ||
+      ownerFromRegistry ||
+      inferBuiltInSkillName(name);
     if (!directHandler && !ownerSkillName) {
       throw new Error(`No owning skill found for tool: ${name}`);
     }

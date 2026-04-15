@@ -228,6 +228,14 @@ class DiscoveryClient:
         except Exception as exc:
             logger.warning("discovery: discover_candidates failed: %s", exc)
 
+        fallback_candidates = await self.list_registration_candidates(
+            target_agent=target_agent,
+            intent=intent,
+            capabilities=capabilities,
+        )
+        if fallback_candidates:
+            return fallback_candidates
+
         return []
 
     async def list_registration_candidates(

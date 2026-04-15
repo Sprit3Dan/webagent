@@ -10,6 +10,11 @@ function sanitizeMessage(m) {
   return runtimeShared.sanitizeMessage(m, "assistant");
 }
 
+function isA2ALifecycleAssistantMessage(message) {
+  const messageType = String(message?.message_type || "").trim().toLowerCase();
+  return messageType === "a2a.lifecycle";
+}
+
 function roleStyle(role) {
   if (role === "user") {
     return {
@@ -41,7 +46,11 @@ function roleStyle(role) {
 export default function MessageCard({ msg }) {
   const m = sanitizeMessage(msg);
   const role = m.role.toLowerCase();
-  const { accent, background } = roleStyle(role);
+  const isA2A = isA2ALifecycleAssistantMessage(m);
+  const baseStyle = roleStyle(role);
+  const accent = isA2A ? "#b388ff" : baseStyle.accent;
+  const background = isA2A ? "rgba(179, 136, 255, 0.12)" : baseStyle.background;
+  const roleLabel = isA2A ? "A2A" : role.toUpperCase();
   const promptMemories = Array.isArray(m?.prompt_memories) ? m.prompt_memories : [];
 
   return (
@@ -65,7 +74,7 @@ export default function MessageCard({ msg }) {
           marginBottom: 6,
         }}
       >
-        <span>{role.toUpperCase()}</span>
+        <span>{roleLabel}</span>
         <span style={{ color: "#93a6b7" }}>{m.timestamp}</span>
       </div>
 

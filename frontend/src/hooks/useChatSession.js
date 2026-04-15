@@ -41,7 +41,10 @@ import {
   normalizeMessages,
   sanitizeMessage,
 } from "../lib/chatState";
-import { buildContextForLlm } from "../lib/contextBuilder";
+import {
+  buildContextForLlm,
+  reseedContextBootstrapFilesFromBackend,
+} from "../lib/contextBuilder";
 import { WEBGPU_EMBEDDINGS_DEFAULTS, embedText } from "../lib/webgpuEmbeddings";
 import { getOrCreateFrontendInstanceId } from "../lib/frontendIdentity";
 
@@ -607,7 +610,7 @@ export default function useChatSession() {
     postedDelegationNotesRef.current.set(noteKey, true);
     const errorText = String(delegation?.error || "").trim();
 
-    let content = `[a2a] ${normalizedStatus} · ${delegationId.slice(0, 8)}… (${from} → ${target})`;
+    let content = `[a2a] ${normalizedStatus} · ${delegationId} (${from} → ${target})`;
     if (normalizedStatus === "done" && resultText) {
       content += `\n\n${resultText}`;
     } else if ((normalizedStatus === "failed" || normalizedStatus === "timeout") && errorText) {
@@ -618,7 +621,8 @@ export default function useChatSession() {
       normalizeMessages([
         ...prev,
         sanitizeMessage({
-          role: "assistant",
+          role: "system",
+          message_type: "a2a.lifecycle",
           content,
           timestamp: new Date().toISOString(),
         }),
@@ -1488,6 +1492,27 @@ export default function useChatSession() {
     }
   }, [setInspectorLoading, setInspectorStatus]);
 
+  const reseedContextBootstrap = useCallback(async () => {
+    setInspectorLoading(true);
+    setInspectorStatus("reseeding OPFS bootstrap files from backend...");
+    try {
+      const result = await reseedContextBootstrapFilesFromBackend();
+      if (!result?.ok) {
+        const reason = result?.error || "unknown error";
+        setInspectorStatus(`reseed failed · ${reason}`);
+        return;
+      }
+
+      const written = Array.isArray(result?.written) ? result.written : [];
+      setInspectorStatus(`reseeded bootstrap · ${written.length} files`);
+      await refreshInspector();
+    } catch (err) {
+      setInspectorStatus(`reseed failed · ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setInspectorLoading(false);
+    }
+  }, [refreshInspector, setInspectorLoading, setInspectorStatus]);
+
   const viewFile = useCallback(
     async (path) => {
       setSelectedFilePath(path);
@@ -1727,6 +1752,7 @@ export default function useChatSession() {
     selectedFileContent,
     selectedFileMeta,
     refreshInspector,
+    reseedContextBootstrap,
     viewFile,
     clearCurrentSession,
 

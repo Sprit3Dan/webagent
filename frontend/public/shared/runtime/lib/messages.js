@@ -30,6 +30,9 @@
         reasoning: typeof (input && input.reasoning) === "string"
           ? input.reasoning
           : undefined,
+        message_type: typeof (input && input.message_type) === "string"
+          ? input.message_type
+          : undefined,
         prompt_memories: Array.isArray(input && input.prompt_memories)
           ? input.prompt_memories
           : undefined,

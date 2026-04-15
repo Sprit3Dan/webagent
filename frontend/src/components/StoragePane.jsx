@@ -86,6 +86,7 @@ export default function StoragePane({
   selectedFileContent = "",
   selectedFileMeta = null,
   onRefresh,
+  onReseedBootstrap,
   onClearSession,
   onViewFile,
 }) {
@@ -129,6 +130,22 @@ export default function StoragePane({
             }}
           >
             {inspectorLoading ? "refreshing..." : "refresh"}
+          </button>
+
+          <button
+            onClick={onReseedBootstrap}
+            disabled={inspectorLoading}
+            style={{
+              border: "1px solid #3b4f67",
+              borderRadius: 6,
+              background: "#13263a",
+              color: "#cfe0ef",
+              padding: "4px 8px",
+              cursor: "pointer",
+              opacity: inspectorLoading ? 0.7 : 1,
+            }}
+          >
+            reseed bootstrap
           </button>
 
           <button

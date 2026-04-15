@@ -45,6 +45,7 @@ async def agent_delegate(
     Body: task (required), targetAgent (optional), intent (optional).
     Returns a dispatch receipt with delegationId and initial status.
     """
+    from ...services.discovery_client import get_discovery_client
     from ...services.orchestrator import run_outbound_delegation
 
     task = payload.get("task")
@@ -54,7 +55,7 @@ async def agent_delegate(
             detail="task is required",
         )
 
-    target_agent = str(payload.get("targetAgent") or "")
+    explicit_target = str(payload.get("targetAgent") or "").strip()
     intent_raw = payload.get("intent")
     intent = str(intent_raw).strip() if intent_raw else None
     task_dict: dict[str, Any] = task if isinstance(task, dict) else {"text": str(task)}
@@ -70,6 +71,36 @@ async def agent_delegate(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="agentId is required",
         )
+
+    target_agent = explicit_target or caller_agent_id
+
+    if explicit_target:
+        discovery = get_discovery_client()
+        if discovery is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Discovery client is not initialized",
+            )
+
+        raw_candidates = await discovery.list_registration_candidates(
+            target_agent=explicit_target,
+            intent=None,
+            capabilities=None,
+        )
+        allowed_candidates = [
+            c
+            for c in raw_candidates
+            if not str(c.get("agent_id") or c.get("agentId") or "").strip().startswith("webagent-")
+        ]
+        matched = any(
+            str(c.get("agent_id") or c.get("agentId") or "").strip() == explicit_target
+            for c in allowed_candidates
+        )
+        if not matched:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="targetAgent is not an allowed discovery candidate",
+            )
 
     return await run_outbound_delegation(
         delegation_id=delegation_id,
@@ -155,15 +186,20 @@ async def list_discovery_candidates(
         if part.strip()
     ] or None
 
-    candidates = await discovery.discover_candidates(
+    candidates = await discovery.list_registration_candidates(
         target_agent=target,
         intent=hint,
         capabilities=cap_list,
     )
+    filtered_candidates = [
+        c
+        for c in candidates
+        if not str(c.get("agent_id") or c.get("agentId") or "").strip().startswith("webagent-")
+    ]
 
     return {
-        "candidates": candidates,
-        "count": len(candidates),
+        "candidates": filtered_candidates,
+        "count": len(filtered_candidates),
         "targetAgent": target,
         "intent": hint,
         "capabilities": cap_list or [],
@@ -178,43 +214,14 @@ async def list_discovery_specialists(
     capabilities: str | None = None,
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    from ...services.discovery_client import get_discovery_client
-
-    if not settings.a2a_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="A2A is disabled",
-        )
-
-    discovery = get_discovery_client()
-    if discovery is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Discovery client is not initialized",
-        )
-
-    target = str(targetAgent or "").strip() or None
-    hint = str(intent or "").strip() or None
-    cap_list = [
-        part.strip()
-        for part in str(capabilities or "").split(",")
-        if part.strip()
-    ] or None
-
-    specialists = await discovery.list_registration_candidates(
-        target_agent=target,
-        intent=hint,
-        capabilities=cap_list,
+    _ = targetAgent, intent, capabilities, settings
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "/api/a2a/discovery/specialists is deprecated. "
+            "Use /api/a2a/discovery/candidates."
+        ),
     )
-
-    return {
-        "specialists": specialists,
-        "count": len(specialists),
-        "targetAgent": target,
-        "intent": hint,
-        "capabilities": cap_list or [],
-        "timestamp": _iso_now(),
-    }
 
 
 @router.get("/a2a/ws/status")

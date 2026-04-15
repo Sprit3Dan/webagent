@@ -43,6 +43,7 @@ function AppShell() {
     selectedFileContent,
     selectedFileMeta,
     refreshInspector,
+    reseedContextBootstrap,
     viewFile,
     clearCurrentSession,
     llmProviders,
@@ -168,6 +169,7 @@ function AppShell() {
           selectedFileContent={selectedFileContent}
           selectedFileMeta={selectedFileMeta}
           onRefresh={refreshInspector}
+          onReseedBootstrap={reseedContextBootstrap}
           onClearSession={clearCurrentSession}
           onViewFile={viewFile}
         />
