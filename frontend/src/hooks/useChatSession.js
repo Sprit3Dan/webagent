@@ -619,17 +619,29 @@ export default function useChatSession() {
       content += `\n\n${errorText}`;
     }
 
-    setMessages((prev) =>
-      normalizeMessages([
-        ...prev,
-        sanitizeMessage({
-          role: "system",
-          message_type: "a2a.lifecycle",
-          content,
-          timestamp: new Date().toISOString(),
-        }),
-      ]),
-    );
+    const lifecycleMessage = sanitizeMessage({
+      role: "system",
+      message_type: "a2a.lifecycle",
+      content,
+      timestamp: new Date().toISOString(),
+    });
+
+    setMessages((prev) => {
+      const withOrder = [...prev, lifecycleMessage].map((message, index) => ({
+        message,
+        index,
+        ts: Date.parse(String(message?.timestamp || "")),
+      }));
+
+      withOrder.sort((a, b) => {
+        const aTs = Number.isFinite(a.ts) ? a.ts : Number.MAX_SAFE_INTEGER;
+        const bTs = Number.isFinite(b.ts) ? b.ts : Number.MAX_SAFE_INTEGER;
+        if (aTs !== bTs) return aTs - bTs;
+        return a.index - b.index;
+      });
+
+      return normalizeMessages(withOrder.map((entry) => entry.message));
+    });
   }, [setMessages]);
 
   useEffect(() => {
@@ -1680,7 +1692,22 @@ export default function useChatSession() {
         timestamp: note.timestamp || new Date().toISOString(),
       });
 
-      setMessages((prev) => normalizeMessages([...prev, msg]));
+      setMessages((prev) => {
+        const withOrder = [...prev, msg].map((message, index) => ({
+          message,
+          index,
+          ts: Date.parse(String(message?.timestamp || "")),
+        }));
+
+        withOrder.sort((a, b) => {
+          const aTs = Number.isFinite(a.ts) ? a.ts : Number.MAX_SAFE_INTEGER;
+          const bTs = Number.isFinite(b.ts) ? b.ts : Number.MAX_SAFE_INTEGER;
+          if (aTs !== bTs) return aTs - bTs;
+          return a.index - b.index;
+        });
+
+        return normalizeMessages(withOrder.map((entry) => entry.message));
+      });
       setStatus("heartbeat: reviewed pending items");
     };
 
