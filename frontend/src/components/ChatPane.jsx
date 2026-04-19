@@ -111,11 +111,6 @@ export default function ChatPane({
       ) : (
         currentPage.map((m, i) => {
           const focused = i === focusedMessageIndex;
-          const messagePromptMemories = Array.isArray(m?.prompt_memories) ? m.prompt_memories : [];
-          const messagePromptMeta =
-            m?.prompt_memory_meta && typeof m.prompt_memory_meta === "object"
-              ? m.prompt_memory_meta
-              : null;
 
           return (
             <React.Fragment key={`${m.timestamp || "msg"}-${pageIndex}-${i}`}>
@@ -129,72 +124,7 @@ export default function ChatPane({
                 <MessageCard msg={m} />
               </div>
 
-              {messagePromptMemories.length ? (
-                <div
-                  style={{
-                    border: "1px solid #2f4257",
-                    background: "rgba(115, 208, 255, 0.08)",
-                    borderRadius: 8,
-                    padding: 10,
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 8,
-                    marginTop: 6,
-                  }}
-                >
-                  <div style={{ fontSize: 12, color: "#73d0ff", fontWeight: 700 }}>
-                    MEMORIES INCLUDED IN PROMPT ({messagePromptMemories.length})
-                  </div>
 
-                  {messagePromptMeta ? (
-                    <div style={{ fontSize: 11, color: "#8fb2cf" }}>
-                      minScore={Number(messagePromptMeta.minScore || 0).toFixed(3)} · topK=
-                      {Number(messagePromptMeta.topK || 0)} · retrievalMs=
-                      {Math.round(Number(messagePromptMeta.retrievalMs || 0))} · hits=
-                      {Number(messagePromptMeta.hitCount || 0)}
-                    </div>
-                  ) : null}
-
-                  {messagePromptMemories.map((item, idx) => {
-                    const score = Number(item?.score || 0).toFixed(3);
-                    const sessionId = String(item?.sessionId || "");
-                    const turnIndex = Math.max(0, Number(item?.turnIndex || 0));
-                    const kind = String(item?.kind || "conversation_turn");
-                    const userText = String(item?.userText || "").replace(/\s+/g, " ").trim();
-                    const assistantText = String(item?.assistantText || "").replace(/\s+/g, " ").trim();
-                    const factText = String(item?.factText || "").replace(/\s+/g, " ").trim();
-
-                    return (
-                      <div
-                        key={`${item?.id || "memory"}-${idx}`}
-                        style={{
-                          borderLeft: "3px solid #73d0ff",
-                          background: "rgba(10, 15, 20, 0.5)",
-                          padding: "8px 10px",
-                        }}
-                      >
-                        <div style={{ fontSize: 11, color: "#8fb2cf", marginBottom: 4 }}>
-                          score={score} · kind={kind} · session={sessionId || "unknown"} · turn={turnIndex}
-                        </div>
-                        {factText ? (
-                          <div style={{ fontSize: 12, color: "#d6e2ee", marginBottom: 2 }}>
-                            <strong>fact:</strong> {factText.slice(0, 280)}
-                          </div>
-                        ) : (
-                          <>
-                            <div style={{ fontSize: 12, color: "#d6e2ee", marginBottom: 2 }}>
-                              <strong>user:</strong> {userText.slice(0, 220)}
-                            </div>
-                            <div style={{ fontSize: 12, color: "#c7d5e2" }}>
-                              <strong>assistant:</strong> {assistantText.slice(0, 220)}
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : null}
             </React.Fragment>
           );
         })

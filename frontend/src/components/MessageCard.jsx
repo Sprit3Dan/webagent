@@ -81,6 +81,11 @@ export default function MessageCard({ msg }) {
   const background = isA2A ? "rgba(179, 136, 255, 0.12)" : baseStyle.background;
   const roleLabel = isA2A ? "A2A" : role.toUpperCase();
   const promptMemories = Array.isArray(m?.prompt_memories) ? m.prompt_memories : [];
+  const retrievedFacts = Array.isArray(m?.retrieved_facts) ? m.retrieved_facts : [];
+  const retrievedFactMeta =
+    m?.retrieved_fact_meta && typeof m.retrieved_fact_meta === "object"
+      ? m.retrieved_fact_meta
+      : null;
   const isToolMessage = role === "tool";
   const toolMessage = isToolMessage ? splitToolMessageContent(m.content) : null;
   const toolResult = isToolMessage ? formatToolResult(toolMessage?.result || "") : "";
@@ -138,6 +143,47 @@ export default function MessageCard({ msg }) {
           <ReactMarkdown>{m.content}</ReactMarkdown>
         </div>
       )}
+
+      {role === "user" && retrievedFacts.length ? (
+        <details style={{ marginTop: 8 }}>
+          <summary style={{ cursor: "pointer", color: "#93a6b7", fontSize: 12 }}>
+            retrieved facts ({retrievedFacts.length})
+          </summary>
+          {retrievedFactMeta ? (
+            <div style={{ marginTop: 6, fontSize: 11, color: "#8fb2cf" }}>
+              minScore={Number(retrievedFactMeta.minScore || 0).toFixed(3)} · topK=
+              {Number(retrievedFactMeta.topK || 0)} · retrievalMs=
+              {Math.round(Number(retrievedFactMeta.retrievalMs || 0))} · hits=
+              {Number(retrievedFactMeta.hitCount || retrievedFacts.length)}
+            </div>
+          ) : null}
+          <div
+            style={{
+              margin: "8px 0 0",
+              color: "#c7d5e2",
+              borderLeft: "1px solid #2a394a",
+              paddingLeft: 8,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            {retrievedFacts.map((item, idx) => {
+              const score = Number(item?.score || 0).toFixed(3);
+              const factType = String(item?.factType || item?.fact_type || "unknown");
+              const factText = String(item?.factText || item?.text || "").replace(/\s+/g, " ").trim();
+              if (!factText) return null;
+
+              return (
+                <div key={`${item?.id || "retrieved-fact"}-${idx}`} style={{ fontSize: 12 }}>
+                  <span style={{ color: "#8fb2cf" }}>score={score} · type={factType}</span>
+                  <span style={{ color: "#d6e2ee" }}> · {factText.slice(0, 320)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      ) : null}
 
       {promptMemories.length ? (
         <details style={{ marginTop: 8 }}>

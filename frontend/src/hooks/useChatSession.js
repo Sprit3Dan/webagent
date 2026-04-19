@@ -50,14 +50,28 @@ import { WEBGPU_EMBEDDINGS_DEFAULTS, embedText } from "../lib/webgpuEmbeddings";
 import { getOrCreateFrontendInstanceId } from "../lib/frontendIdentity";
 
 const CONTEXT_WINDOW_TOKEN_BUDGET = 32_000;
-const MEMORY_KNN_TOP_K = 12;
-const MEMORY_MIN_SCORE_FLOOR = 0.72;
-const MEMORY_SCORE_MARGIN_FROM_TOP = 0.08;
-const MEMORY_MAX_PROMPT_HITS = 8;
+const MEMORY_KNN_TOP_K = 8;
+const MEMORY_MIN_SCORE_FLOOR = 0.78;
+const MEMORY_SCORE_MARGIN_FROM_TOP = 0.04;
+const MEMORY_MAX_PROMPT_HITS = 4;
 const MEMORY_EMBED_MODEL = WEBGPU_EMBEDDINGS_DEFAULTS.model;
 const MEMORY_EMBED_DEVICE = WEBGPU_EMBEDDINGS_DEFAULTS.device;
 const FACT_EXTRACTION_MAX_FACTS = 3;
 const FACT_EXTRACTION_MIN_USER_CHARS = 12;
+const FACT_EXTRACTION_TYPES = Object.freeze([
+  "user_profile",
+  "preference",
+  "constraint",
+  "long_term_goal",
+  "project_context",
+  "transient_task",
+  "format_instruction",
+  "sentiment_reaction",
+  "acknowledgement",
+  "unknown",
+]);
+const FACT_EXTRACTION_MIN_CONFIDENCE = 0.4;
+const FACT_EXTRACTION_MIN_DURABILITY = 0.45;
 const FACT_DEDUP_KNN_THRESHOLD = 0.95;
 const CHAT_RUNTIME_AGENT_ID = getOrCreateFrontendInstanceId();
 
@@ -305,22 +319,192 @@ function parseMemoryControlDirectives(input = "") {
   return { ignoreMemory, forgetQuery };
 }
 
+function normalizeExtractedFactType(input = "") {
+  const normalized = String(input || "").replace(/\s+/g, "_").trim().toLowerCase();
+  if (!normalized) return "unknown";
+  return FACT_EXTRACTION_TYPES.includes(normalized) ? normalized : "unknown";
+}
+
+function normalizeExtractedFactNumber(input, fallback = 0.6) {
+  const raw = Number(input);
+  if (!Number.isFinite(raw)) return clamp(Number(fallback) || 0.6, 0, 1);
+  return clamp(raw, 0, 1);
+}
+
+function normalizeExtractedFactsPayload(parsed) {
+  const source = Array.isArray(parsed?.facts) ? parsed.facts : [];
+  const out = [];
+  const seen = new Set();
+
+  for (const item of source) {
+    const isObject = item && typeof item === "object";
+    const text = String(
+      isObject
+        ? (item?.text ?? item?.fact ?? item?.fact_text ?? "")
+        : item,
+    ).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+
+    const factType = normalizeExtractedFactType(
+      isObject ? (item?.factType ?? item?.fact_type) : "unknown",
+    );
+    const confidence = normalizeExtractedFactNumber(
+      isObject ? item?.confidence : 0.6,
+      0.6,
+    );
+    const durability = normalizeExtractedFactNumber(
+      isObject ? item?.durability : confidence,
+      confidence,
+    );
+    const store = isObject && typeof item?.store === "boolean" ? item.store : true;
+
+    if (!store) continue;
+    if (confidence < FACT_EXTRACTION_MIN_CONFIDENCE) continue;
+    if (durability < FACT_EXTRACTION_MIN_DURABILITY) continue;
+
+    seen.add(key);
+    out.push({
+      text,
+      factType,
+      confidence,
+      durability,
+      store: true,
+      rationale: isObject ? String(item?.rationale || "").trim() : "",
+    });
+
+    if (out.length >= FACT_EXTRACTION_MAX_FACTS) break;
+  }
+
+  return out;
+}
+
+function buildPostTurnFactExtractionPayload({
+  messages = [],
+  turnIndex = 0,
+  maxMessages = 14,
+  maxCharsPerMessage = 320,
+} = {}) {
+  const source = Array.isArray(messages) ? messages : [];
+  const start = Math.max(0, source.length - Math.max(1, Number(maxMessages) || 14));
+  const tail = source.slice(start);
+
+  const structuredMessages = tail.map((msg, idx) => {
+    const role = String(msg?.role || "unknown").trim().toLowerCase() || "unknown";
+    const messageType = String(msg?.message_type || "chat.message").trim() || "chat.message";
+    const content = String(msg?.content || "").replace(/\s+/g, " ").trim();
+    const compactContent = content.slice(0, Math.max(64, Number(maxCharsPerMessage) || 320));
+
+    const toolCalls = Array.isArray(msg?.tool_calls)
+      ? msg.tool_calls.map((call) => ({
+          id: String(call?.id || ""),
+          name: String(call?.function?.name || ""),
+          hasArguments: Boolean(String(call?.function?.arguments || "").trim()),
+        }))
+      : [];
+
+    return {
+      index: start + idx,
+      role,
+      message_type: messageType,
+      timestamp: String(msg?.timestamp || ""),
+      content: compactContent,
+      tool_calls: toolCalls,
+    };
+  });
+
+  const toolNotions = structuredMessages
+    .filter((row) => row.role === "tool" || (Array.isArray(row.tool_calls) && row.tool_calls.length > 0))
+    .map((row) => ({
+      index: row.index,
+      role: row.role,
+      message_type: row.message_type,
+      tool_call_count: Array.isArray(row.tool_calls) ? row.tool_calls.length : 0,
+      tool_names: Array.isArray(row.tool_calls) ? row.tool_calls.map((call) => call.name).filter(Boolean) : [],
+      status_hint: row.role === "tool" ? "tool_event_observed" : "assistant_requested_tools",
+    }));
+
+  return {
+    turnIndex: Math.max(0, Number(turnIndex) || 0),
+    messageCount: structuredMessages.length,
+    messages: structuredMessages,
+    toolNotions: toolNotions.slice(0, 12),
+  };
+}
+
+function attachRetrievedFactsToLatestUserMessage(messages = [], facts = [], meta = null) {
+  const source = Array.isArray(messages) ? messages : [];
+  const retrievedFacts = Array.isArray(facts) ? facts : [];
+  if (!source.length || !retrievedFacts.length) return source;
+
+  const targetIndex = source
+    .map((message, index) => ({ message, index }))
+    .reverse()
+    .find((entry) => String(entry?.message?.role || "").toLowerCase() === "user")
+    ?.index;
+
+  if (typeof targetIndex !== "number" || targetIndex < 0) return source;
+
+  const next = [...source];
+  const current = next[targetIndex];
+
+  next[targetIndex] = sanitizeMessage({
+    ...current,
+    retrieved_facts: retrievedFacts,
+    retrieved_fact_meta: meta && typeof meta === "object" ? meta : undefined,
+    retrieved_fact_ids: retrievedFacts
+      .map((item) => String(item?.id || "").trim())
+      .filter(Boolean),
+  });
+
+  return next;
+}
+
 async function extractMajorUserFactsWithLlm({
+  roundPayload = null,
   userText = "",
   selectedLlmProvider = null,
   tenantId = "tenant-dev",
   userId = "user-001",
   sessionId = "default",
 } = {}) {
-  const text = String(userText || "").trim();
-  if (text.length < FACT_EXTRACTION_MIN_USER_CHARS) return [];
+  const fallbackUserText = String(userText || "").trim();
+  const safeRoundPayload =
+    roundPayload && typeof roundPayload === "object" ? roundPayload : null;
+  const extractionInput = safeRoundPayload || {
+    turnIndex: 0,
+    messageCount: 1,
+    messages: [
+      {
+        index: 0,
+        role: "user",
+        message_type: "chat.message",
+        timestamp: "",
+        content: fallbackUserText,
+        tool_calls: [],
+      },
+    ],
+    toolNotions: [],
+  };
+
+  const userEvidenceChars = extractionInput.messages
+    .filter((row) => String(row?.role || "") === "user")
+    .map((row) => String(row?.content || ""))
+    .join(" ")
+    .trim().length;
+
+  if (userEvidenceChars < FACT_EXTRACTION_MIN_USER_CHARS) return [];
 
   const systemPrompt = [
-    "Extract only major, durable user facts from the message.",
-    "Return strict JSON object: {\"facts\":[\"...\"]}.",
+    "You are a memory extraction system.",
+    "Read the structured dialogue bundle and extract only user-relevant memory facts.",
+    "Return strict JSON object only: {\"facts\":[{\"text\":\"...\",\"fact_type\":\"...\",\"confidence\":0-1,\"durability\":0-1,\"store\":true|false,\"rationale\":\"...\"}]}",
     `Include at most ${FACT_EXTRACTION_MAX_FACTS} facts.`,
-    "Do not include transient requests like 'more' or short acknowledgements.",
-    "If no major facts, return {\"facts\":[]}.",
+    `Allowed fact_type values: ${FACT_EXTRACTION_TYPES.join(", ")}.`,
+    "Prefer durable facts. Use assistant/tool messages only as supporting evidence.",
+    "Mark transient instructions, formatting requests, sentiment-only reactions, and acknowledgements as store:false.",
   ].join(" ");
 
   const payload = {
@@ -332,7 +516,7 @@ async function extractMajorUserFactsWithLlm({
     stream: false,
     messages: [
       { role: "system", content: systemPrompt },
-      { role: "user", content: text },
+      { role: "user", content: JSON.stringify(extractionInput) },
     ],
     metadata: {
       llmProvider: {
@@ -351,7 +535,8 @@ async function extractMajorUserFactsWithLlm({
 
   try {
     console.info("[memory:facts] extractor:start", {
-      userChars: text.length,
+      userChars: userEvidenceChars,
+      messageCount: Number(extractionInput?.messageCount || 0),
       maxFacts: FACT_EXTRACTION_MAX_FACTS,
       model: payload.model,
       hasBaseUrl: Boolean(payload?.metadata?.llmProvider?.baseUrl),
@@ -416,19 +601,7 @@ async function extractMajorUserFactsWithLlm({
       .trim();
 
     const parsed = parseJsonSafe(normalized, null) || parseJsonSafe(raw, null);
-    const facts = Array.isArray(parsed?.facts) ? parsed.facts : [];
-
-    const deduped = [];
-    const seen = new Set();
-    for (const item of facts) {
-      const fact = String(item || "").replace(/\s+/g, " ").trim();
-      if (!fact) continue;
-      const key = fact.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      deduped.push(fact);
-      if (deduped.length >= FACT_EXTRACTION_MAX_FACTS) break;
-    }
+    const typedFacts = normalizeExtractedFactsPayload(parsed);
 
     const endedAt =
       typeof performance !== "undefined" && typeof performance.now === "function"
@@ -437,11 +610,17 @@ async function extractMajorUserFactsWithLlm({
 
     console.info("[memory:facts] extractor:done", {
       durationMs: Math.round(endedAt - startedAt),
-      parsedFacts: deduped.length,
-      rawPreview: raw.slice(0, 220),
+      parsedFacts: typedFacts.length,
+      typeCounts: typedFacts.reduce((acc, row) => {
+        const type = String(row?.factType || "unknown");
+        acc[type] = (acc[type] || 0) + 1;
+        return acc;
+      }, {}),
+      rawLength: raw.length,
+      rawPayload: raw,
     });
 
-    return deduped;
+    return typedFacts;
   } catch (err) {
     const endedAt =
       typeof performance !== "undefined" && typeof performance.now === "function"
@@ -743,7 +922,7 @@ export default function useChatSession() {
       }
     }
 
-    const shouldSkipBackgroundMemory = ignoreMemoryThisTurn || Boolean(forgetMemoryQuery);
+    const shouldSkipBackgroundMemory = true;
     try {
       memoryQueued = !shouldSkipBackgroundMemory;
 
@@ -963,28 +1142,11 @@ export default function useChatSession() {
               device: MEMORY_EMBED_DEVICE,
             });
 
-            const totalPriorUserTurns = historyWithoutCurrent
-              .filter((m) => String(m?.role || "") === "user")
-              .length;
-            const slidingWindowUserTurns = slidingWindowHistory
-              .filter((m) => String(m?.role || "") === "user")
-              .length;
-            const firstExcludedTurnIndex = Math.max(
-              0,
-              totalPriorUserTurns - slidingWindowUserTurns,
-            );
-            const excludeTurnIndexes = Array.from(
-              { length: slidingWindowUserTurns },
-              (_, idx) => firstExcludedTurnIndex + idx,
-            );
-
             const knn = await searchConversationMemoryKnn({
               tenantId: CONTEXT.tenantId,
               userId: CONTEXT.userId,
               agentId: CHAT_RUNTIME_AGENT_ID,
               sessionId: CONTEXT.sessionId,
-              excludeSessionId: CONTEXT.sessionId,
-              excludeTurnIndexes,
               queryEmbedding: queryEmbedding.embedding,
               topK: MEMORY_KNN_TOP_K,
               minScore: MEMORY_MIN_SCORE_FLOOR,
@@ -1005,6 +1167,7 @@ export default function useChatSession() {
             const adaptiveMinScore = Math.max(
               MEMORY_MIN_SCORE_FLOOR,
               topScore - MEMORY_SCORE_MARGIN_FROM_TOP,
+              topScore * 0.92,
             );
 
             const scoredHits = rawHits.filter(
@@ -1033,6 +1196,16 @@ export default function useChatSession() {
               dedupedHitCount: dedupedHits.length,
               hitCount: memoryHits.length,
             };
+
+            if (!isInternalPrompt && memoryHits.length) {
+              setMessages((prev) =>
+                attachRetrievedFactsToLatestUserMessage(
+                  prev,
+                  memoryHits,
+                  promptMemoryMetaForAssistant,
+                ),
+              );
+            }
 
             logMemoryRetrieval({
               queryText: currentMessage,
@@ -1459,7 +1632,111 @@ export default function useChatSession() {
       });
       setTelemetry({ usage, compaction });
 
+      const shouldSkipPostTurnMemory = ignoreMemoryThisTurn || Boolean(forgetMemoryQuery);
+      if (!shouldSkipPostTurnMemory) {
+        memoryQueued = true;
+        void (async () => {
+          const startedAt =
+            typeof performance !== "undefined" && typeof performance.now === "function"
+              ? performance.now()
+              : Date.now();
 
+          try {
+            const roundMessages = normalizeMessages([
+              ...nextMessages,
+              ...generatedAggregate,
+            ]);
+            const roundPayload = buildPostTurnFactExtractionPayload({
+              messages: roundMessages,
+              turnIndex,
+            });
+
+            const extractedFacts = await extractMajorUserFactsWithLlm({
+              roundPayload,
+              selectedLlmProvider,
+              tenantId: CONTEXT.tenantId,
+              userId: CONTEXT.userId,
+              sessionId: CONTEXT.sessionId,
+            });
+
+            if (!extractedFacts.length) {
+              console.info("[memory:facts] post-turn:none", {
+                turnIndex,
+                durationMs: Math.round(
+                  (typeof performance !== "undefined" && typeof performance.now === "function"
+                    ? performance.now()
+                    : Date.now()) - startedAt,
+                ),
+              });
+              return;
+            }
+
+            const embeddedFacts = await Promise.all(
+              extractedFacts.map(async (fact, factIndex) => {
+                const factText = String(fact?.text || "").trim();
+                const vec = await embedText(factText, {
+                  model: MEMORY_EMBED_MODEL,
+                  device: MEMORY_EMBED_DEVICE,
+                });
+
+                return {
+                  text: factText,
+                  confidence: Number(fact?.confidence || 0),
+                  durability: Number(fact?.durability || 0),
+                  factType: String(fact?.factType || "unknown"),
+                  store: true,
+                  rationale: String(fact?.rationale || ""),
+                  embedding: Array.isArray(vec?.embedding) ? vec.embedding : [],
+                  factIndex,
+                };
+              }),
+            );
+
+            const dedupedFacts = [];
+            for (const fact of embeddedFacts) {
+              const candidateVec = Array.isArray(fact?.embedding) ? fact.embedding : [];
+              if (!candidateVec.length) continue;
+
+              const duplicateInBatch = dedupedFacts.some((row) => {
+                const priorVec = Array.isArray(row?.embedding) ? row.embedding : [];
+                if (!priorVec.length || priorVec.length !== candidateVec.length) return false;
+                return cosineSimilarityVectors(candidateVec, priorVec) >= FACT_DEDUP_KNN_THRESHOLD;
+              });
+
+              if (!duplicateInBatch) dedupedFacts.push(fact);
+            }
+
+            if (!dedupedFacts.length) return;
+
+            await writeConversationFactMemories({
+              tenantId: CONTEXT.tenantId,
+              userId: CONTEXT.userId,
+              agentId: CHAT_RUNTIME_AGENT_ID,
+              sessionId: CONTEXT.sessionId,
+              turnIndex,
+              embeddingModel: MEMORY_EMBED_MODEL,
+              facts: dedupedFacts,
+            });
+
+            const endedAt =
+              typeof performance !== "undefined" && typeof performance.now === "function"
+                ? performance.now()
+                : Date.now();
+
+            console.info("[memory:facts] post-turn:stored", {
+              turnIndex,
+              stored: dedupedFacts.length,
+              extracted: extractedFacts.length,
+              durationMs: Math.round(endedAt - startedAt),
+            });
+          } catch (postTurnErr) {
+            console.warn(
+              "[memory:facts] post-turn failed",
+              postTurnErr instanceof Error ? postTurnErr.message : "unknown error",
+            );
+          }
+        })();
+      }
 
       const tokenPart = typeof usage?.totalTokens === "number" ? ` · ${usage.totalTokens} tok` : "";
       const compactPart = compaction?.triggered ? ` · compacted ${compaction?.droppedMessages ?? 0}` : "";

@@ -18,6 +18,18 @@ export function sanitizeMessage(message, fallbackRole = "assistant") {
     normalized.prompt_memory_meta = message.prompt_memory_meta;
   }
 
+  if (Array.isArray(message?.retrieved_facts)) {
+    normalized.retrieved_facts = message.retrieved_facts;
+  }
+
+  if (message?.retrieved_fact_meta && typeof message.retrieved_fact_meta === "object") {
+    normalized.retrieved_fact_meta = message.retrieved_fact_meta;
+  }
+
+  if (Array.isArray(message?.retrieved_fact_ids)) {
+    normalized.retrieved_fact_ids = message.retrieved_fact_ids;
+  }
+
   return normalized;
 }
 

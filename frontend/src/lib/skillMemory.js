@@ -47,6 +47,19 @@ export const FACT_CONFIDENCE_DECAY_ON_CONTRADICTION = 0.2;
 export const FACT_SCORE_CONFIDENCE_WEIGHT = 0.14;
 export const FACT_SCORE_CONFIRMATION_WEIGHT = 0.06;
 export const FACT_SCORE_RECENCY_WEIGHT = 0.08;
+export const FACT_SCORE_DURABILITY_WEIGHT = 0.12;
+export const FACT_TYPE_RETRIEVAL_WEIGHTS = Object.freeze({
+  user_profile: 0.08,
+  preference: 0.08,
+  constraint: 0.09,
+  long_term_goal: 0.07,
+  project_context: 0.06,
+  transient_task: -0.06,
+  format_instruction: -0.08,
+  sentiment_reaction: -0.08,
+  acknowledgement: -0.1,
+  unknown: 0,
+});
 export const A2A_DELEGATION_SCOPE_PREFIX = "a2a-delegations";
 export const A2A_DELEGATION_DOC_KIND = "a2a_delegation";
 
@@ -739,6 +752,11 @@ function normalizeFactText(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
 }
 
+function normalizeFactType(input, fallback = "unknown") {
+  const value = String(input || fallback).replace(/\s+/g, "_").trim().toLowerCase();
+  return value || String(fallback || "unknown");
+}
+
 function normalizeFactConfidence(input, fallback = 0.6) {
   const raw = Number(input);
   const value = Number.isFinite(raw) ? raw : Number(fallback);
@@ -760,19 +778,42 @@ function clamp01(value) {
 function computeFactHybridScore({
   similarity = 0,
   confidence = 0.6,
+  durability = null,
+  factType = "unknown",
   confirmedCount = 0,
   recencyBonus = 0,
   confidenceWeight = FACT_SCORE_CONFIDENCE_WEIGHT,
   confirmationWeight = FACT_SCORE_CONFIRMATION_WEIGHT,
   recencyWeight = FACT_SCORE_RECENCY_WEIGHT,
+  durabilityWeight = FACT_SCORE_DURABILITY_WEIGHT,
+  typeWeights = FACT_TYPE_RETRIEVAL_WEIGHTS,
 } = {}) {
   const sim = clamp01(similarity);
   const conf = clamp01(confidence);
+  const durable = clamp01(
+    durability == null ? conf : normalizeFactConfidence(durability, conf),
+  );
   const confirms = normalizeConfirmedCount(confirmedCount);
-  const confirmationBoost = Math.log2(1 + confirms) * confirmationWeight;
+
+  const confirmationBoost = Math.min(
+    0.12,
+    Math.log2(1 + confirms) * confirmationWeight,
+  );
   const freshnessBoost = clamp01(recencyBonus) * recencyWeight;
-  const score = sim + conf * confidenceWeight + confirmationBoost + freshnessBoost;
-  return clamp01(score);
+  const durabilityBoost = durable * durabilityWeight;
+  const normalizedType = normalizeFactType(factType, "unknown");
+  const typeBias = clamp01(Number(typeWeights?.[normalizedType] || 0) + 0.5) - 0.5;
+
+  const raw =
+    sim * 0.72 +
+    conf * confidenceWeight +
+    durabilityBoost +
+    freshnessBoost +
+    confirmationBoost +
+    typeBias * 0.5;
+
+  const squashed = 1 / (1 + Math.exp(-6 * (raw - 0.55)));
+  return clamp01(squashed);
 }
 
 function areFactsContradictory(leftText, rightText) {
@@ -906,13 +947,21 @@ export async function writeConversationFactMemories({
       const text = normalizeFactText(item?.text);
       const embedding = normalizeVector(item?.embedding);
       const confidence = normalizeFactConfidence(item?.confidence, 0.6);
-      const confirmedCount = normalizeConfirmedCount(item?.confirmedCount || 1);
-      if (!text || !embedding.length) return null;
+      const durability = normalizeFactConfidence(item?.durability, confidence);
+      const factType = normalizeFactType(item?.factType || item?.fact_type);
+      const store = typeof item?.store === "boolean" ? item.store : true;
+      const rationale = normalizeFactText(item?.rationale);
+      const confirmedCount = normalizeConfirmedCount(item?.confirmedCount ?? 1);
+      if (!text || !embedding.length || !store) return null;
       return {
         id: buildConversationFactMemoryId({ sessionId, turnIndex, factIndex: idx }),
         text,
         embedding,
         confidence,
+        durability,
+        factType,
+        store,
+        rationale,
         confirmedCount,
       };
     })
@@ -946,7 +995,7 @@ export async function writeConversationFactMemories({
   for (let i = 0; i < normalizedFacts.length; i += 1) {
     const fact = normalizedFacts[i];
     const factConfidence = normalizeFactConfidence(fact.confidence, 0.6);
-    const factConfirmedCount = normalizeConfirmedCount(fact.confirmedCount || 1);
+    const factConfirmedCount = normalizeConfirmedCount(fact.confirmedCount ?? 1);
 
     let bestSimilar = null;
     let bestSimilarity = 0;
@@ -989,6 +1038,13 @@ export async function writeConversationFactMemories({
         embeddingModel: String(embeddingModel || bestSimilar?.embeddingModel || ""),
         dimensions: fact.embedding.length,
         confidence: nextConfidence,
+        durability: normalizeFactConfidence(
+          fact?.durability,
+          normalizeFactConfidence(bestSimilar?.durability, nextConfidence),
+        ),
+        factType: normalizeFactType(fact?.factType || bestSimilar?.factType),
+        store: true,
+        rationale: normalizeFactText(fact?.rationale || bestSimilar?.rationale || ""),
         confirmedCount: nextConfirmedCount,
         createdAt: String(bestSimilar?.createdAt || now),
         updatedAt: now,
@@ -1004,6 +1060,13 @@ export async function writeConversationFactMemories({
           text: normalizeFactText(fact.text),
           embedding: fact.embedding,
           confidence: nextConfidence,
+          durability: normalizeFactConfidence(
+            fact?.durability,
+            normalizeFactConfidence(knownFacts[idx]?.durability, nextConfidence),
+          ),
+          factType: normalizeFactType(fact?.factType || knownFacts[idx]?.factType),
+          store: true,
+          rationale: normalizeFactText(fact?.rationale || knownFacts[idx]?.rationale || ""),
           confirmedCount: nextConfirmedCount,
           updatedAt: now,
         };
@@ -1072,6 +1135,10 @@ export async function writeConversationFactMemories({
       embeddingModel: String(embeddingModel || ""),
       dimensions: fact.embedding.length,
       confidence: factConfidence,
+      durability: normalizeFactConfidence(fact?.durability, factConfidence),
+      factType: normalizeFactType(fact?.factType),
+      store: true,
+      rationale: normalizeFactText(fact?.rationale || ""),
       confirmedCount: factConfirmedCount,
       createdAt: now,
       updatedAt: now,
@@ -1093,6 +1160,10 @@ export async function writeConversationFactMemories({
       embeddingModel: String(embeddingModel || ""),
       dimensions: fact.embedding.length,
       confidence: factConfidence,
+      durability: normalizeFactConfidence(fact?.durability, factConfidence),
+      factType: normalizeFactType(fact?.factType),
+      store: true,
+      rationale: normalizeFactText(fact?.rationale || ""),
       confirmedCount: factConfirmedCount,
       createdAt: now,
       updatedAt: now,
@@ -1370,10 +1441,14 @@ export async function searchConversationMemoryKnn({
 
     const baseScore = cosineSimilarity(query, doc?.embedding || []);
     const confidence = normalizeFactConfidence(doc?.confidence, 0.6);
+    const durability = normalizeFactConfidence(doc?.durability, confidence);
+    const factType = normalizeFactType(doc?.factType || doc?.fact_type, "unknown");
     const confirmedCount = normalizeConfirmedCount(doc?.confirmedCount);
     const hybridScore = computeFactHybridScore({
       similarity: baseScore,
       confidence,
+      durability,
+      factType,
       confirmedCount,
       recencyBonus,
     });
@@ -1386,6 +1461,8 @@ export async function searchConversationMemoryKnn({
       recencyBonus,
       sessionBonus,
       confidence,
+      durability: normalizeFactConfidence(doc?.durability, confidence),
+      factType: normalizeFactType(doc?.factType || doc?.fact_type),
       confirmedCount,
       kind,
       turnIndex: Number(doc?.turnIndex || 0),
